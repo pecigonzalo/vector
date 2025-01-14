@@ -1,21 +1,21 @@
 use async_trait::async_trait;
-use codecs::JsonSerializerConfig;
 use futures::StreamExt;
 use futures_util::stream::BoxStream;
 use indoc::indoc;
-use lookup::lookup_v2::OptionalValuePath;
-use vector_common::sensitive_string::SensitiveString;
-use vector_config::configurable_component;
-use vector_core::{sink::StreamSink, transform::Transform};
+use vector_lib::codecs::JsonSerializerConfig;
+use vector_lib::configurable::configurable_component;
+use vector_lib::lookup;
+use vector_lib::lookup::lookup_v2::{ConfigValuePath, OptionalTargetPath, OptionalValuePath};
+use vector_lib::sensitive_string::SensitiveString;
+use vector_lib::sink::StreamSink;
 
 use super::{
-    host_key,
+    config_host_key,
     logs::{HumioLogsConfig, HOST},
 };
 use crate::{
     config::{
-        AcknowledgementsConfig, GenerateConfig, Input, SinkConfig, SinkContext, TransformConfig,
-        TransformContext,
+        AcknowledgementsConfig, GenerateConfig, Input, SinkConfig, SinkContext, TransformContext,
     },
     event::{Event, EventArray, EventContainer},
     sinks::{
@@ -25,7 +25,10 @@ use crate::{
     },
     template::Template,
     tls::TlsConfig,
-    transforms::{metric_to_log::MetricToLogConfig, OutputBuffer},
+    transforms::{
+        metric_to_log::{MetricToLog, MetricToLogConfig},
+        FunctionTransform, OutputBuffer,
+    },
 };
 
 /// Configuration for the `humio_metrics` sink.
@@ -36,7 +39,7 @@ use crate::{
 // `humio_logs` config here.
 //
 // [1]: https://github.com/serde-rs/serde/issues/1504
-#[configurable_component(sink("humio_metrics"))]
+#[configurable_component(sink("humio_metrics", "Deliver metric event data to Humio."))]
 #[derive(Clone, Debug)]
 #[serde(deny_unknown_fields)]
 pub struct HumioMetricsConfig {
@@ -53,7 +56,7 @@ pub struct HumioMetricsConfig {
     /// The base URL of the Humio instance.
     ///
     /// The scheme (`http` or `https`) must be specified. No path should be included since the paths defined
-    /// by the [`Splunk`][splunk] api are used.
+    /// by the [`Splunk`][splunk] API are used.
     ///
     /// [splunk]: https://docs.splunk.com/Documentation/Splunk/8.0.0/Data/HECRESTendpoints
     #[serde(alias = "host")]
@@ -71,7 +74,7 @@ pub struct HumioMetricsConfig {
 
     /// The type of events sent to this sink. Humio uses this as the name of the parser to use to ingest the data.
     ///
-    /// If unset, Humio will default it to none.
+    /// If unset, Humio defaults it to none.
     #[configurable(metadata(
         docs::examples = "json",
         docs::examples = "none",
@@ -79,13 +82,14 @@ pub struct HumioMetricsConfig {
     ))]
     event_type: Option<Template>,
 
-    /// Overrides the name of the log field used to grab the hostname to send to Humio.
+    /// Overrides the name of the log field used to retrieve the hostname to send to Humio.
     ///
-    /// By default, the [global `log_schema.host_key` option][global_host_key] is used.
+    /// By default, the [global `log_schema.host_key` option][global_host_key] is used if log
+    /// events are Legacy namespaced, or the semantic meaning of "host" is used, if defined.
     ///
     /// [global_host_key]: https://vector.dev/docs/reference/configuration/global-options/#log_schema.host_key
-    #[serde(default = "host_key")]
-    host_key: String,
+    #[serde(default = "config_host_key")]
+    host_key: OptionalValuePath,
 
     /// Event fields to be added to Humio’s extra fields.
     ///
@@ -95,7 +99,7 @@ pub struct HumioMetricsConfig {
     ///
     /// [humio_data_format]: https://docs.humio.com/integrations/data-shippers/hec/#format-of-data
     #[serde(default)]
-    indexed_fields: Vec<String>,
+    indexed_fields: Vec<ConfigValuePath>,
 
     /// Optional name of the repository to ingest into.
     ///
@@ -129,7 +133,7 @@ pub struct HumioMetricsConfig {
     #[serde(
         default,
         deserialize_with = "crate::serde::bool_or_struct",
-        skip_serializing_if = "crate::serde::skip_serializing_if_default"
+        skip_serializing_if = "crate::serde::is_default"
     )]
     acknowledgements: AcknowledgementsConfig,
 }
@@ -149,13 +153,12 @@ impl GenerateConfig for HumioMetricsConfig {
 }
 
 #[async_trait::async_trait]
+#[typetag::serde(name = "humio_metrics")]
 impl SinkConfig for HumioMetricsConfig {
     async fn build(&self, cx: SinkContext) -> crate::Result<(VectorSink, Healthcheck)> {
         let transform = self
             .transform
-            .clone()
-            .build(&TransformContext::new_with_globals(cx.globals.clone()))
-            .await?;
+            .build_transform(&TransformContext::new_with_globals(cx.globals.clone()));
 
         let sink = HumioLogsConfig {
             token: self.token.clone(),
@@ -163,7 +166,10 @@ impl SinkConfig for HumioMetricsConfig {
             source: self.source.clone(),
             encoding: JsonSerializerConfig::default().into(),
             event_type: self.event_type.clone(),
-            host_key: self.host_key.clone(),
+            host_key: OptionalTargetPath::from(
+                vrl::path::PathPrefix::Event,
+                self.host_key.path.clone(),
+            ),
             indexed_fields: self.indexed_fields.clone(),
             index: self.index.clone(),
             compression: self.compression,
@@ -173,9 +179,10 @@ impl SinkConfig for HumioMetricsConfig {
             timestamp_nanos_key: None,
             acknowledgements: Default::default(),
             // hard coded as humio expects this format so no sense in making it configurable
-            timestamp_key: OptionalValuePath {
-                path: Some(lookup::owned_value_path!("timestamp")),
-            },
+            timestamp_key: OptionalTargetPath::from(
+                vrl::path::PathPrefix::Event,
+                Some(lookup::owned_value_path!("timestamp")),
+            ),
         };
 
         let (sink, healthcheck) = sink.clone().build(cx).await?;
@@ -199,7 +206,7 @@ impl SinkConfig for HumioMetricsConfig {
 
 pub struct HumioMetricsSink {
     inner: VectorSink,
-    transform: Transform,
+    transform: MetricToLog,
 }
 
 #[async_trait]
@@ -210,7 +217,7 @@ impl StreamSink<EventArray> for HumioMetricsSink {
             .run(input.map(move |events| {
                 let mut buf = OutputBuffer::with_capacity(events.len());
                 for event in events.into_events() {
-                    transform.as_function().transform(&mut buf, event);
+                    transform.transform(&mut buf, event);
                 }
                 // Awkward but necessary for the `EventArray` type
                 let events = buf.into_events().map(Event::into_log).collect::<Vec<_>>();
@@ -226,7 +233,7 @@ mod tests {
     use futures::stream;
     use indoc::indoc;
     use similar_asserts::assert_eq;
-    use vector_core::metric_tags;
+    use vector_lib::metric_tags;
 
     use super::*;
     use crate::{
@@ -294,8 +301,8 @@ mod tests {
                 )
                 .with_tags(Some(metric_tags!("os.host" => "somehost")))
                 .with_timestamp(Some(
-                    Utc.ymd(2020, 8, 18)
-                        .and_hms_opt(21, 0, 1)
+                    Utc.with_ymd_and_hms(2020, 8, 18, 21, 0, 1)
+                        .single()
                         .expect("invalid timestamp"),
                 )),
             ),
@@ -304,14 +311,14 @@ mod tests {
                     "metric2",
                     MetricKind::Absolute,
                     MetricValue::Distribution {
-                        samples: vector_core::samples![1.0 => 100, 2.0 => 200, 3.0 => 300],
+                        samples: vector_lib::samples![1.0 => 100, 2.0 => 200, 3.0 => 300],
                         statistic: StatisticKind::Histogram,
                     },
                 )
                 .with_tags(Some(metric_tags!("os.host" => "somehost")))
                 .with_timestamp(Some(
-                    Utc.ymd(2020, 8, 18)
-                        .and_hms_opt(21, 0, 2)
+                    Utc.with_ymd_and_hms(2020, 8, 18, 21, 0, 2)
+                        .single()
                         .expect("invalid timestamp"),
                 )),
             ),
@@ -362,8 +369,8 @@ mod tests {
                 "code" => "success"
             )))
             .with_timestamp(Some(
-                Utc.ymd(2020, 8, 18)
-                    .and_hms_opt(21, 0, 1)
+                Utc.with_ymd_and_hms(2020, 8, 18, 21, 0, 1)
+                    .single()
                     .expect("invalid timestamp"),
             )),
         )];

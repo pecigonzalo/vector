@@ -2,7 +2,8 @@ use std::{error, fmt, path::PathBuf};
 
 use bytes::{Buf, BufMut};
 use metrics_tracing_context::{MetricsLayer, TracingContextLayer};
-use metrics_util::{debugging::DebuggingRecorder, layers::Layer};
+use metrics_util::debugging::DebuggingRecorder;
+use metrics_util::layers::Layer;
 use tracing::Span;
 use tracing_subscriber::prelude::__tracing_subscriber_SubscriberExt;
 use vector_buffers::{
@@ -102,7 +103,7 @@ impl<const N: usize> FixedEncodable for Message<N> {
         let id = buffer.get_u64();
         for _ in 0..N {
             // this covers self._padding
-            let _ = buffer.get_u64();
+            _ = buffer.get_u64();
         }
         Ok(Message::new(id))
     }
@@ -138,12 +139,10 @@ pub async fn setup<const N: usize>(
 }
 
 pub fn init_instrumentation() {
-    if metrics::try_recorder().is_none() {
-        let subscriber = tracing_subscriber::Registry::default().with(MetricsLayer::new());
-        tracing::subscriber::set_global_default(subscriber).unwrap();
-
+    let subscriber = tracing_subscriber::Registry::default().with(MetricsLayer::new());
+    if tracing::subscriber::set_global_default(subscriber).is_ok() {
         let recorder = TracingContextLayer::all().layer(DebuggingRecorder::new());
-        metrics::set_boxed_recorder(Box::new(recorder)).unwrap();
+        metrics::set_global_recorder(recorder).unwrap();
     }
 }
 
@@ -163,7 +162,7 @@ pub async fn wtr_measurement<const N: usize>(
     messages: Vec<Message<N>>,
 ) {
     for msg in messages.into_iter() {
-        sender.send(msg).await.unwrap();
+        sender.send(msg, None).await.unwrap();
     }
     drop(sender);
 
@@ -176,7 +175,7 @@ pub async fn war_measurement<const N: usize>(
     messages: Vec<Message<N>>,
 ) {
     for msg in messages.into_iter() {
-        sender.send(msg).await.unwrap();
-        let _ = receiver.next().await.unwrap();
+        sender.send(msg, None).await.unwrap();
+        _ = receiver.next().await.unwrap();
     }
 }

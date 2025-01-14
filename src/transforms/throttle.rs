@@ -5,18 +5,36 @@ use futures::{Stream, StreamExt};
 use governor::{clock, Quota, RateLimiter};
 use serde_with::serde_as;
 use snafu::Snafu;
-use vector_config::configurable_component;
-use vector_core::config::LogNamespace;
+use vector_lib::config::{clone_input_definitions, LogNamespace};
+use vector_lib::configurable::configurable_component;
 
 use crate::{
     conditions::{AnyCondition, Condition},
-    config::{DataType, Input, Output, TransformConfig, TransformContext},
+    config::{DataType, Input, OutputId, TransformConfig, TransformContext, TransformOutput},
     event::Event,
     internal_events::{TemplateRenderingError, ThrottleEventDiscarded},
     schema,
     template::Template,
     transforms::{TaskTransform, Transform},
 };
+
+/// Configuration of internal metrics for the Throttle transform.
+#[configurable_component]
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+#[serde(deny_unknown_fields)]
+pub struct ThrottleInternalMetricsConfig {
+    /// Whether or not to emit the `events_discarded_total` internal metric with the `key` tag.
+    ///
+    /// If true, the counter will be incremented for each discarded event, including the key value
+    /// associated with the discarded event. If false, the counter will not be emitted. Instead, the
+    /// number of discarded events can be seen through the `component_discarded_events_total` internal
+    /// metric.
+    ///
+    /// Note that this defaults to false because the `key` tag has potentially unbounded cardinality.
+    /// Only set this to true if you know that the number of unique keys is bounded.
+    #[serde(default)]
+    pub emit_events_discarded_per_key: bool,
+}
 
 /// Configuration for the `throttle` transform.
 #[serde_as]
@@ -30,20 +48,23 @@ pub struct ThrottleConfig {
     threshold: u32,
 
     /// The time window in which the configured `threshold` is applied, in seconds.
-    #[serde_as(as = "serde_with::DurationSeconds<f64>")]
+    #[serde_as(as = "serde_with::DurationSecondsWithFrac<f64>")]
+    #[configurable(metadata(docs::human_name = "Time Window"))]
     window_secs: Duration,
 
-    /// The name of the log field whose value is hashed to determine if the event should be
-    /// rate limited.
+    /// The value to group events into separate buckets to be rate limited independently.
     ///
-    /// Each unique key creates a bucket of related events to be rate limited separately. If
-    /// left unspecified, or if the event doesn't have `key_field`, then the event is not rate
+    /// If left unspecified, or if the event doesn't have `key_field`, then the event is not rate
     /// limited separately.
     #[configurable(metadata(docs::examples = "{{ message }}", docs::examples = "{{ hostname }}",))]
     key_field: Option<Template>,
 
     /// A logical condition used to exclude events from sampling.
     exclude: Option<AnyCondition>,
+
+    #[configurable(derived)]
+    #[serde(default)]
+    internal_metrics: ThrottleInternalMetricsConfig,
 }
 
 impl_generate_config_from_default!(ThrottleConfig);
@@ -59,9 +80,17 @@ impl TransformConfig for ThrottleConfig {
         Input::log()
     }
 
-    fn outputs(&self, merged_definition: &schema::Definition, _: LogNamespace) -> Vec<Output> {
+    fn outputs(
+        &self,
+        _: vector_lib::enrichment::TableRegistry,
+        input_definitions: &[(OutputId, schema::Definition)],
+        _: LogNamespace,
+    ) -> Vec<TransformOutput> {
         // The event is not modified, so the definition is passed through as-is
-        vec![Output::default(DataType::Log).with_schema_definition(merged_definition.clone())]
+        vec![TransformOutput::new(
+            DataType::Log,
+            clone_input_definitions(input_definitions),
+        )]
     }
 }
 
@@ -72,6 +101,7 @@ pub struct Throttle<C: clock::Clock<Instant = I>, I: clock::Reference> {
     key_field: Option<Template>,
     exclude: Option<Condition>,
     clock: C,
+    internal_metrics: ThrottleInternalMetricsConfig,
 }
 
 impl<C, I> Throttle<C, I>
@@ -109,13 +139,14 @@ where
             flush_keys_interval,
             key_field: config.key_field.clone(),
             exclude,
+            internal_metrics: config.internal_metrics.clone(),
         })
     }
 }
 
 impl<C, I> TaskTransform<Event> for Throttle<C, I>
 where
-    C: clock::Clock<Instant = I> + Send + 'static,
+    C: clock::Clock<Instant = I> + Send + 'static + Clone,
     I: clock::Reference + Send + 'static,
 {
     fn transform(
@@ -127,7 +158,7 @@ where
     {
         let mut flush_keys = tokio::time::interval(self.flush_keys_interval * 2);
 
-        let limiter = RateLimiter::dashmap_with_clock(self.quota, &self.clock);
+        let limiter = RateLimiter::dashmap_with_clock(self.quota, self.clock.clone());
 
         Box::pin(stream! {
           loop {
@@ -163,11 +194,10 @@ where
                                         Some(event)
                                     }
                                     _ => {
-                                        if let Some(key) = key {
-                                            emit!(ThrottleEventDiscarded{key})
-                                        } else {
-                                            emit!(ThrottleEventDiscarded{key: "None".to_string()})
-                                        }
+                                        emit!(ThrottleEventDiscarded{
+                                            key: key.unwrap_or_else(|| "None".to_string()),
+                                            emit_events_discarded_per_key: self.internal_metrics.emit_events_discarded_per_key
+                                        });
                                         None
                                     }
                                 }
@@ -221,10 +251,10 @@ mod tests {
     async fn throttle_events() {
         let clock = clock::FakeRelativeClock::default();
         let config = toml::from_str::<ThrottleConfig>(
-            r#"
+            r"
 threshold = 2
 window_secs = 5
-"#,
+",
         )
         .unwrap();
 
@@ -414,6 +444,7 @@ key_field = "{{ bucket }}"
                 window_secs: Duration::from_secs_f64(1.0),
                 key_field: None,
                 exclude: None,
+                internal_metrics: Default::default(),
             };
             let (tx, rx) = mpsc::channel(1);
             let (topology, mut out) = create_topology(ReceiverStream::new(rx), config).await;

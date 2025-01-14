@@ -24,7 +24,12 @@ components: sinks: axiom: {
 				max_bytes:    1_048_576
 				timeout_secs: 1.0
 			}
-			compression: enabled: false
+			compression: {
+				enabled: true
+				default: "zstd"
+				algorithms: ["zstd"]
+				levels: ["none", "fast", "default", "best", 0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+			}
 			encoding: {
 				enabled: true
 				codec: enabled: false
@@ -89,14 +94,5 @@ components: sinks: axiom: {
 				2. Once registered, create a new dataset and create an API token for it
 				"""
 		}
-	}
-
-	telemetry: metrics: {
-		component_sent_bytes_total:       components.sources.internal_metrics.output.metrics.component_sent_bytes_total
-		component_sent_events_total:      components.sources.internal_metrics.output.metrics.component_sent_events_total
-		component_sent_event_bytes_total: components.sources.internal_metrics.output.metrics.component_sent_event_bytes_total
-		events_discarded_total:           components.sources.internal_metrics.output.metrics.events_discarded_total
-		events_out_total:                 components.sources.internal_metrics.output.metrics.events_out_total
-		processing_errors_total:          components.sources.internal_metrics.output.metrics.processing_errors_total
 	}
 }

@@ -1,59 +1,16 @@
 use std::collections::HashMap;
 
-use futures::future::FutureExt;
-use value::Kind;
-use vector_config::configurable_component;
+use vrl::value::Kind;
 
 use super::{healthcheck::healthcheck, sink::LokiSink};
 use crate::{
-    codecs::EncodingConfig,
-    config::{AcknowledgementsConfig, DataType, GenerateConfig, Input, SinkConfig, SinkContext},
     http::{Auth, HttpClient, MaybeAuth},
     schema,
-    sinks::{
-        util::{BatchConfig, Compression, SinkBatchSettings, TowerRequestConfig, UriSerde},
-        VectorSink,
-    },
-    template::Template,
-    tls::{TlsConfig, TlsSettings},
+    sinks::{prelude::*, util::UriSerde},
 };
 
-/// Loki-specific compression.
-#[configurable_component]
-#[derive(Debug, Copy, Clone, Eq, PartialEq)]
-pub enum ExtendedCompression {
-    /// Snappy compression.
-    ///
-    /// This implies sending push requests as Protocol Buffers.
-    #[serde(rename = "snappy")]
-    Snappy,
-}
-
-/// Compression configuration.
-#[configurable_component]
-#[derive(Debug, Copy, Clone, Eq, PartialEq)]
-#[serde(untagged)]
-pub enum CompressionConfigAdapter {
-    /// Basic compression.
-    Original(Compression),
-
-    /// Loki-specific compression.
-    Extended(ExtendedCompression),
-}
-
-impl CompressionConfigAdapter {
-    pub const fn content_encoding(self) -> Option<&'static str> {
-        match self {
-            CompressionConfigAdapter::Original(compression) => compression.content_encoding(),
-            CompressionConfigAdapter::Extended(_) => Some("snappy"),
-        }
-    }
-}
-
-impl Default for CompressionConfigAdapter {
-    fn default() -> Self {
-        CompressionConfigAdapter::Extended(ExtendedCompression::Snappy)
-    }
+const fn default_compression() -> Compression {
+    Compression::Snappy
 }
 
 fn default_loki_path() -> String {
@@ -61,7 +18,7 @@ fn default_loki_path() -> String {
 }
 
 /// Configuration for the `loki` sink.
-#[configurable_component(sink("loki"))]
+#[configurable_component(sink("loki", "Deliver log event data to the Loki aggregation system."))]
 #[derive(Clone, Debug)]
 #[serde(deny_unknown_fields)]
 pub struct LokiConfig {
@@ -109,15 +66,33 @@ pub struct LokiConfig {
     #[serde(default = "crate::serde::default_false")]
     pub remove_label_fields: bool,
 
+    /// Structured metadata that is attached to each batch of events.
+    ///
+    /// Both keys and values are templateable, which enables you to attach dynamic structured metadata to events.
+    ///
+    /// Valid metadata keys include `*`, and prefixes ending with `*`, to allow for the expansion of
+    /// objects into multiple metadata entries. This follows the same logic as [Label expansion][label_expansion].
+    ///
+    /// [label_expansion]: https://vector.dev/docs/reference/configuration/sinks/loki/#label-expansion
+    #[configurable(metadata(docs::examples = "loki_structured_metadata_examples()"))]
+    #[configurable(metadata(docs::additional_props_description = "Loki structured metadata."))]
+    #[serde(default)]
+    pub structured_metadata: HashMap<Template, Template>,
+
+    /// Whether or not to delete fields from the event when they are used in structured metadata.
+    #[serde(default = "crate::serde::default_false")]
+    pub remove_structured_metadata_fields: bool,
+
     /// Whether or not to remove the timestamp from the event payload.
     ///
-    /// The timestamp will still be sent as event metadata for Loki to use for indexing.
+    /// The timestamp is still sent as event metadata for Loki to use for indexing.
     #[serde(default = "crate::serde::default_true")]
     pub remove_timestamp: bool,
 
-    #[configurable(derived)]
-    #[serde(default)]
-    pub compression: CompressionConfigAdapter,
+    /// Compression configuration.
+    /// Snappy compression implies sending push requests as Protocol Buffers.
+    #[serde(default = "default_compression")]
+    pub compression: Compression,
 
     #[configurable(derived)]
     #[serde(default)]
@@ -141,12 +116,27 @@ pub struct LokiConfig {
     #[serde(
         default,
         deserialize_with = "crate::serde::bool_or_struct",
-        skip_serializing_if = "crate::serde::skip_serializing_if_default"
+        skip_serializing_if = "crate::serde::is_default"
     )]
     acknowledgements: AcknowledgementsConfig,
 }
 
 fn loki_labels_examples() -> HashMap<String, String> {
+    let mut examples = HashMap::new();
+    examples.insert("source".to_string(), "vector".to_string());
+    examples.insert(
+        "\"pod_labels_*\"".to_string(),
+        "{{ kubernetes.pod_labels }}".to_string(),
+    );
+    examples.insert("\"*\"".to_string(), "{{ metadata }}".to_string());
+    examples.insert(
+        "{{ event_field }}".to_string(),
+        "{{ some_other_event_field }}".to_string(),
+    );
+    examples
+}
+
+fn loki_structured_metadata_examples() -> HashMap<String, String> {
     let mut examples = HashMap::new();
     examples.insert("source".to_string(), "vector".to_string());
     examples.insert(
@@ -172,9 +162,9 @@ impl SinkBatchSettings for LokiDefaultBatchSettings {
 
 /// Out-of-order event behavior.
 ///
-/// Some sources may generate events with timestamps that aren’t in chronological order. While the
-/// sink will sort events before sending them to Loki, there is the chance another event comes in
-/// that is out-of-order with respective the latest events sent to Loki. Prior to Loki 2.4.0, this
+/// Some sources may generate events with timestamps that aren't in chronological order. Even though the
+/// sink sorts the events before sending them to Loki, there is a chance that another event could come in
+/// that is out of order with the latest events sent to Loki. Prior to Loki 2.4.0, this
 /// was not supported and would result in an error during the push request.
 ///
 /// If you're using Loki 2.4.0 or newer, `Accept` is the preferred action, which lets Loki handle
@@ -185,19 +175,19 @@ impl SinkBatchSettings for LokiDefaultBatchSettings {
 #[derivative(Default)]
 #[serde(rename_all = "snake_case")]
 pub enum OutOfOrderAction {
-    /// Drop the event.
-    #[derivative(Default)]
-    Drop,
-
-    /// Rewrite the timestamp of the event to the timestamp of the latest event seen by the sink.
-    RewriteTimestamp,
-
     /// Accept the event.
     ///
     /// The event is not dropped and is sent without modification.
     ///
     /// Requires Loki 2.4.0 or newer.
+    #[derivative(Default)]
     Accept,
+
+    /// Rewrite the timestamp of the event to the timestamp of the latest event seen by the sink.
+    RewriteTimestamp,
+
+    /// Drop the event.
+    Drop,
 }
 
 impl GenerateConfig for LokiConfig {
@@ -213,13 +203,14 @@ impl GenerateConfig for LokiConfig {
 
 impl LokiConfig {
     pub(super) fn build_client(&self, cx: SinkContext) -> crate::Result<HttpClient> {
-        let tls = TlsSettings::from_options(&self.tls)?;
+        let tls = TlsSettings::from_options(self.tls.as_ref())?;
         let client = HttpClient::new(tls, cx.proxy())?;
         Ok(client)
     }
 }
 
 #[async_trait::async_trait]
+#[typetag::serde(name = "loki")]
 impl SinkConfig for LokiConfig {
     async fn build(
         &self,

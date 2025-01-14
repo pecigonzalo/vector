@@ -1,8 +1,8 @@
-use codecs::{encoding::Framer, JsonSerializerConfig, NewlineDelimitedEncoderConfig};
 use opendal::{layers::LoggingLayer, services::Webhdfs, Operator};
 use tower::ServiceBuilder;
-use vector_config::configurable_component;
-use vector_core::{
+use vector_lib::codecs::{encoding::Framer, JsonSerializerConfig, NewlineDelimitedEncoderConfig};
+use vector_lib::configurable::configurable_component;
+use vector_lib::{
     config::{AcknowledgementsConfig, DataType, Input},
     sink::VectorSink,
 };
@@ -21,39 +21,7 @@ use crate::{
 };
 
 /// Configuration for the `webhdfs` sink.
-///
-/// The Hadoop Distributed File System (HDFS) is a distributed file system
-/// designed to run on commodity hardware. HDFS consists of a namenode and a
-/// datanode. We will send rpc to namenode to know which datanode to send
-/// and receive data to. Also, HDFS will rebalance data across the cluster
-/// to make sure each file has enough redundancy.
-///
-/// ```txt
-///                     ┌───────────────┐
-///                     │  Data Node 2  │
-///                     └───────────────┘
-///                             ▲
-/// ┌───────────────┐           │            ┌───────────────┐
-/// │  Data Node 1  │◄──────────┼───────────►│  Data Node 3  │
-/// └───────────────┘           │            └───────────────┘
-///                     ┌───────┴───────┐
-///                     │   Name Node   │
-///                     └───────────────┘
-///                             ▲
-///                             │
-///                      ┌──────┴─────┐
-///                      │   Vector   │
-///                      └────────────┘
-/// ```
-///
-/// WebHDFS will connect to the HTTP RESTful API of HDFS.
-///
-/// For more information, please refer to:
-///
-/// - [HDFS Users Guide](https://hadoop.apache.org/docs/stable/hadoop-project-dist/hadoop-hdfs/HdfsUserGuide.html)
-/// - [WebHDFS REST API](https://hadoop.apache.org/docs/stable/hadoop-project-dist/hadoop-hdfs/WebHDFS.html)
-/// - [opendal::services::webhdfs](https://docs.rs/opendal/latest/opendal/services/struct.Webhdfs.html)
-#[configurable_component(sink("webhdfs"))]
+#[configurable_component(sink("webhdfs", "WebHDFS."))]
 #[derive(Clone, Debug)]
 #[serde(deny_unknown_fields)]
 pub struct WebHdfsConfig {
@@ -61,17 +29,17 @@ pub struct WebHdfsConfig {
     ///
     /// Must be a valid directory.
     ///
-    /// The final file path with be like `{root}/{prefix}{suffix}`.
+    /// The final file path is in the format of `{root}/{prefix}{suffix}`.
     #[serde(default)]
     pub root: String,
 
     /// A prefix to apply to all keys.
     ///
-    /// Prefixes are useful for partitioning objects, such as by creating an blob key that
-    /// stores blobs under a particular "directory". If using a prefix for this purpose, it must end
+    /// Prefixes are useful for partitioning objects, such as by creating a blob key that
+    /// stores blobs under a particular directory. If using a prefix for this purpose, it must end
     /// in `/` to act as a directory path. A trailing `/` is **not** automatically added.
     ///
-    /// The final file path with be like `{root}/{prefix}{suffix}`.
+    /// The final file path is in the format of `{root}/{prefix}{suffix}`.
     #[serde(default)]
     #[configurable(metadata(docs::templateable))]
     pub prefix: String,
@@ -82,7 +50,7 @@ pub struct WebHdfsConfig {
     ///
     /// For more information, see the [HDFS Architecture][hdfs_arch] documentation.
     ///
-    /// [hdfs_arch]: https://hadoop.apache.org/docs/r3.3.4/hadoop-project-dist/hadoop-hdfs/WebHdfsDesign.html#NameNode_and_DataNodes
+    /// [hdfs_arch]: https://hadoop.apache.org/docs/r3.3.4/hadoop-project-dist/hadoop-hdfs/HdfsDesign.html#NameNode_and_DataNodes
     #[serde(default)]
     #[configurable(metadata(docs::examples = "http://127.0.0.1:9870"))]
     pub endpoint: String,
@@ -102,7 +70,7 @@ pub struct WebHdfsConfig {
     #[serde(
         default,
         deserialize_with = "crate::serde::bool_or_struct",
-        skip_serializing_if = "crate::serde::skip_serializing_if_default"
+        skip_serializing_if = "crate::serde::is_default"
     )]
     pub acknowledgements: AcknowledgementsConfig,
 }
@@ -129,6 +97,7 @@ impl GenerateConfig for WebHdfsConfig {
 }
 
 #[async_trait::async_trait]
+#[typetag::serde(name = "webhdfs")]
 impl SinkConfig for WebHdfsConfig {
     async fn build(&self, _cx: SinkContext) -> crate::Result<(VectorSink, Healthcheck)> {
         let op = self.build_operator()?;
@@ -191,6 +160,6 @@ impl WebHdfsConfig {
 
     pub fn key_partitioner(&self) -> crate::Result<KeyPartitioner> {
         let prefix = self.prefix.clone().try_into()?;
-        Ok(KeyPartitioner::new(prefix))
+        Ok(KeyPartitioner::new(prefix, None))
     }
 }

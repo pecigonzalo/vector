@@ -22,15 +22,9 @@ Provide some module level comments to explain what the sink does.
 Let's setup all the imports we will need for the tutorial:
 
 ```rust
-use super::Healthcheck;
-use crate::config::{GenerateConfig, SinkConfig, SinkContext};
-use futures::{stream::BoxStream, StreamExt};
-use vector_common::finalization::{EventStatus, Finalizable};
-use vector_config::configurable_component;
-use vector_core::{
-    config::{AcknowledgementsConfig, Input},
-    event::Event,
-    sink::{StreamSink, VectorSink},
+use crate::sinks::prelude::*;
+use vector_lib::internal_event::{
+    ByteSize, BytesSent, EventsSent, InternalEventHandle, Output, Protocol,
 };
 ```
 
@@ -50,7 +44,7 @@ pub struct BasicConfig {
     #[serde(
         default,
         deserialize_with = "crate::serde::bool_or_struct",
-        skip_serializing_if = "crate::serde::skip_serializing_if_default"
+        skip_serializing_if = "crate::serde::is_default"
     )]
     pub acknowledgements: AcknowledgementsConfig,
 }
@@ -84,10 +78,12 @@ configuration for the sink.
 # SinkConfig
 
 We need to implement the [`SinkConfig`][sink_config] trait. This is used by
-Vector to generate the main Sink from the configuration.
+Vector to generate the main Sink from the configuration. Note that type name
+given to `typetag` below must match the name of the configurable component above.
 
 ```rust
 #[async_trait::async_trait]
+#[typetag::serde(name = "basic")]
 impl SinkConfig for BasicConfig {
     async fn build(&self, _cx: SinkContext) -> crate::Result<(VectorSink, Healthcheck)> {
         let healthcheck = Box::pin(async move { Ok(()) });
@@ -207,59 +203,6 @@ sinks-logs = [
   "sinks-chronicle",
 ```
 
-## Module
-
-Import this module into Vector. In `src/sinks/mod.rs` add the lines:
-
-
-```diff
-  #[cfg(feature = "sinks-azure_monitor_logs")]
-  pub mod azure_monitor_logs;
-+ #[cfg(feature = "sinks-basic")]
-+ pub mod basic;
-  #[cfg(feature = "sinks-blackhole")]
-  pub mod blackhole;
-```
-
-All sinks are feature gated, this allows us to build custom versions of Vector
-with only the components required. We will ignore the feature flag for now with
-our new basic sink.
-
-Next, each sink needs to be added to the [`Sinks`][sinks_enum] enum. Find the
-enum in `mod.rs` and add our new sink to it.
-
-```diff
-#[configurable_component]
-#[allow(clippy::large_enum_variant)]
-#[derive(Clone, Debug)]
-#[serde(tag = "type", rename_all = "snake_case")]
-#[enum_dispatch(SinkConfig)]
-pub enum Sinks {
-    ...
-
-+    /// Basic
-+    #[cfg(feature = "sinks-basic")]
-+    Basic(#[configurable(derived)] basic::BasicConfig),
-
-    ...
-
-```
-
-Then we need to add this to the `get_component_name` function defined below.
-
-```diff
-
-    fn get_component_name(&self) -> &'static str {
-        match self {
-            ...
-
-+           #[cfg(feature = "sinks-basic")]
-+           Self::Basic(config) => config.get_component_name(),
-
-            ...
-
-```
-
 # Acknowledgements
 
 When our sink finishes processing the event, it needs to acknowledge this so
@@ -313,15 +256,13 @@ emit the event. Change the body of `run_inner` to look like the following:
 
 ```diff
     async fn run_inner(self: Box<Self>, mut input: BoxStream<'_, Event>) -> Result<(), ()> {
++       let bytes_sent = register!(BytesSent::from(Protocol("console".into(),)));
+
         while let Some(mut event) = input.next().await {
 +           let bytes = format!("{:#?}", event);
 +           println!("{}", bytes);
 -           println!("{:#?}", event);
-
-+           emit!(BytesSent {
-+               byte_size: bytes.len(),
-+               protocol: "none".into()
-+           });
++           bytes_sent.emit(ByteSize(bytes.len()));
 
             let finalizers = event.take_finalizers();
             finalizers.update_status(EventStatus::Delivered);
@@ -333,18 +274,30 @@ emit the event. Change the body of `run_inner` to look like the following:
 
 ## EventSent
 
-[`EventSent`][events_sent] is emmitted by each component in Vector to
+[`EventSent`][events_sent] is emitted by each component in Vector to
 instrument how many bytes have been sent to the next downstream component.
 
-Add the following after emitting `BytesSent`:
+Change the body of `run_inner` to look like the following:
 
 ```diff
-+     let event_byte_size = event.estimated_json_encoded_size_of();
-+     emit!(EventsSent {
-+         count: 1,
-+         byte_size: event_byte_size,
-+         output: None,
-+     })
+    async fn run_inner(self: Box<Self>, mut input: BoxStream<'_, Event>) -> Result<(), ()> {
+        let bytes_sent = register!(BytesSent::from(Protocol("console".into(),)));
++       let events_sent = register!(EventsSent::from(Output(None)));
+
+        while let Some(mut event) = input.next().await {
+            let bytes = format!("{:#?}", event);
+            println!("{}", bytes);
+            bytes_sent.emit(ByteSize(bytes.len()));
+
++           let event_byte_size = event.estimated_json_encoded_size_of();
++           events_sent.emit(CountByteSize(1, event_byte_size));
+
+            let finalizers = event.take_finalizers();
+            finalizers.update_status(EventStatus::Delivered);
+        }
+
+        Ok(())
+    }
 ```
 
 More details about instrumenting Vector can be found

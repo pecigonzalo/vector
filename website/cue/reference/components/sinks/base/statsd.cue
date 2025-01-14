@@ -14,9 +14,9 @@ base: components: sinks: statsd: configuration: {
 			description: """
 				Whether or not end-to-end acknowledgements are enabled.
 
-				When enabled for a sink, any source connected to that sink, where the source supports
-				end-to-end acknowledgements as well, will wait for events to be acknowledged by the sink
-				before acknowledging them at the source.
+				When enabled for a sink, any source connected to that sink where the source supports
+				end-to-end acknowledgements as well, waits for events to be acknowledged by **all
+				connected** sinks before acknowledging them at the source.
 
 				Enabling or disabling acknowledgements at the sink level takes precedence over any global
 				[`acknowledgements`][global_acks] configuration.
@@ -31,25 +31,24 @@ base: components: sinks: statsd: configuration: {
 		description: """
 			The address to connect to.
 
-			Both IP address and hostname are accepted formats.
+			Both IP addresses and hostnames/fully qualified domain names (FQDNs) are accepted formats.
 
 			The address _must_ include a port.
 			"""
 		relevant_when: "mode = \"tcp\" or mode = \"udp\""
 		required:      true
-		type: string: examples: ["92.12.333.224:5000", "https://somehost:5000"]
+		type: string: examples: ["92.12.333.224:5000", "somehost:5000"]
 	}
 	batch: {
-		description:   "Event batching behavior."
-		relevant_when: "mode = \"udp\""
-		required:      false
+		description: "Event batching behavior."
+		required:    false
 		type: object: options: {
 			max_bytes: {
 				description: """
-					The maximum size of a batch that will be processed by a sink.
+					The maximum size of a batch that is processed by a sink.
 
 					This is based on the uncompressed size of the batched events, before they are
-					serialized / compressed.
+					serialized/compressed.
 					"""
 				required: false
 				type: uint: {
@@ -114,14 +113,13 @@ base: components: sinks: statsd: configuration: {
 		required:      true
 		type: string: examples: ["/path/to/socket"]
 	}
-	send_buffer_bytes: {
+	send_buffer_size: {
 		description: """
 			The size of the socket's send buffer.
 
 			If set, the value of the setting is passed via the `SO_SNDBUF` option.
 			"""
-		relevant_when: "mode = \"tcp\" or mode = \"udp\""
-		required:      false
+		required: false
 		type: uint: {
 			examples: [
 				65536,
@@ -193,16 +191,25 @@ base: components: sinks: statsd: configuration: {
 				required: false
 				type: string: examples: ["${KEY_PASS_ENV_VAR}", "PassWord1"]
 			}
+			server_name: {
+				description: """
+					Server name to use when using Server Name Indication (SNI).
+
+					Only relevant for outgoing connections.
+					"""
+				required: false
+				type: string: examples: ["www.example.com"]
+			}
 			verify_certificate: {
 				description: """
-					Enables certificate verification.
+					Enables certificate verification. For components that create a server, this requires that the
+					client connections have a valid client certificate. For components that initiate requests,
+					this validates that the upstream has a valid certificate.
 
 					If enabled, certificates must not be expired and must be issued by a trusted
 					issuer. This verification operates in a hierarchical manner, checking that the leaf certificate (the
 					certificate presented by the client/server) is not only valid, but that the issuer of that certificate is also valid, and
 					so on until the verification process reaches a root certificate.
-
-					Relevant for both incoming and outgoing connections.
 
 					Do NOT set this to `false` unless you understand the risks of not verifying the validity of certificates.
 					"""
@@ -222,6 +229,18 @@ base: components: sinks: statsd: configuration: {
 					"""
 				required: false
 				type: bool: {}
+			}
+		}
+	}
+	unix_mode: {
+		description:   "The Unix socket mode to use."
+		relevant_when: "mode = \"unix\""
+		required:      false
+		type: string: {
+			default: "Stream"
+			enum: {
+				Datagram: "Datagram-oriented (`SOCK_DGRAM`)."
+				Stream:   "Stream-oriented (`SOCK_STREAM`)."
 			}
 		}
 	}

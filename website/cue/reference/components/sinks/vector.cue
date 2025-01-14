@@ -12,7 +12,7 @@ components: sinks: vector: {
 	classes: {
 		commonly_used: false
 		delivery:      "best_effort"
-		development:   "beta"
+		development:   "stable"
 		egress_method: "batch"
 		service_providers: []
 		stateful: false
@@ -30,6 +30,7 @@ components: sinks: vector: {
 			}
 			compression: enabled: false
 			encoding: enabled:    false
+			proxy: enabled:       true
 			request: {
 				enabled: true
 				headers: false
@@ -77,14 +78,9 @@ components: sinks: vector: {
 
 	configuration: base.components.sinks.vector.configuration
 
-	how_it_works: components.sources.vector.how_it_works
+	how_it_works: components.sinks.vector.how_it_works
 
 	telemetry: metrics: {
-		component_sent_bytes_total:       components.sources.internal_metrics.output.metrics.component_sent_bytes_total
-		component_sent_events_total:      components.sources.internal_metrics.output.metrics.component_sent_events_total
-		component_sent_event_bytes_total: components.sources.internal_metrics.output.metrics.component_sent_event_bytes_total
-		processed_bytes_total:            components.sources.internal_metrics.output.metrics.processed_bytes_total
-		processed_events_total:           components.sources.internal_metrics.output.metrics.processed_events_total
-		protobuf_decode_errors_total:     components.sources.internal_metrics.output.metrics.protobuf_decode_errors_total
+		protobuf_decode_errors_total: components.sources.internal_metrics.output.metrics.protobuf_decode_errors_total
 	}
 }

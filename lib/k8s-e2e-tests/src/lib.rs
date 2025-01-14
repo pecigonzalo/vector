@@ -17,7 +17,7 @@ pub mod metrics;
 pub const BUSYBOX_IMAGE: &str = "busybox:1.28";
 
 pub fn init() {
-    let _ = env_logger::builder().is_test(true).try_init();
+    _ = env_logger::builder().is_test(true).try_init();
 }
 
 pub fn get_namespace() -> String {
@@ -307,7 +307,7 @@ where
     Ok(())
 }
 
-/// Create a pod for our other pods to have an affinity to to ensure they are all deployed on
+/// Create a pod for our other pods to have an affinity to ensure they are all deployed on
 /// the same node.
 pub async fn create_affinity_pod(
     framework: &Framework,

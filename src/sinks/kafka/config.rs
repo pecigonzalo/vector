@@ -1,38 +1,35 @@
 use std::{collections::HashMap, time::Duration};
 
-use codecs::JsonSerializerConfig;
 use futures::FutureExt;
 use rdkafka::ClientConfig;
 use serde_with::serde_as;
-use value::Kind;
-use vector_config::configurable_component;
-use vector_core::schema::Requirement;
+use vector_lib::codecs::JsonSerializerConfig;
+use vector_lib::configurable::configurable_component;
+use vector_lib::lookup::lookup_v2::ConfigTargetPath;
+use vrl::value::Kind;
 
 use crate::{
-    codecs::EncodingConfig,
-    config::{AcknowledgementsConfig, DataType, GenerateConfig, Input, SinkConfig, SinkContext},
     kafka::{KafkaAuthConfig, KafkaCompression},
     serde::json::to_string,
     sinks::{
         kafka::sink::{healthcheck, KafkaSink},
-        util::{BatchConfig, NoDefaultsBatchSettings},
-        Healthcheck, VectorSink,
+        prelude::*,
     },
-    template::Template,
 };
-
-pub(crate) const QUEUED_MIN_MESSAGES: u64 = 100000;
 
 /// Configuration for the `kafka` sink.
 #[serde_as]
-#[configurable_component(sink("kafka"))]
+#[configurable_component(sink(
+    "kafka",
+    "Publish observability event data to Apache Kafka topics."
+))]
 #[derive(Clone, Debug)]
 #[serde(deny_unknown_fields)]
 pub struct KafkaSinkConfig {
     /// A comma-separated list of Kafka bootstrap servers.
     ///
     /// These are the servers in a Kafka cluster that a client should use to bootstrap its
-    /// connection to the cluster, allowing discovering all other hosts in the cluster.
+    /// connection to the cluster, allowing discovery of all the other hosts in the cluster.
     ///
     /// Must be in the form of `host:port`, and comma-separated.
     #[configurable(metadata(docs::examples = "10.14.22.123:9092,10.14.23.332:9092"))]
@@ -46,16 +43,24 @@ pub struct KafkaSinkConfig {
     ))]
     pub topic: Template,
 
-    /// The log field name or tags key to use for the topic key.
+    /// The topic name to use for healthcheck. If omitted, `topic` is used.
+    /// This option helps prevent healthcheck warnings when `topic` is templated.
     ///
-    /// If the field does not exist in the log or in tags, a blank value will be used. If
+    /// It is ignored when healthcheck is disabled.
+    pub healthcheck_topic: Option<String>,
+
+    /// The log field name or tag key to use for the topic key.
+    ///
+    /// If the field does not exist in the log or in the tags, a blank value is used. If
     /// unspecified, the key is not sent.
     ///
     /// Kafka uses a hash of the key to choose the partition or uses round-robin if the record has
     /// no key.
     #[configurable(metadata(docs::advanced))]
     #[configurable(metadata(docs::examples = "user_id"))]
-    pub key_field: Option<String>,
+    #[configurable(metadata(docs::examples = ".my_topic"))]
+    #[configurable(metadata(docs::examples = "%my_topic"))]
+    pub key_field: Option<ConfigTargetPath>,
 
     #[configurable(derived)]
     pub encoding: EncodingConfig,
@@ -80,12 +85,14 @@ pub struct KafkaSinkConfig {
     #[serde(default = "default_socket_timeout_ms")]
     #[configurable(metadata(docs::examples = 30000, docs::examples = 60000))]
     #[configurable(metadata(docs::advanced))]
+    #[configurable(metadata(docs::human_name = "Socket Timeout"))]
     pub socket_timeout_ms: Duration,
 
     /// Local message timeout, in milliseconds.
     #[serde_as(as = "serde_with::DurationMilliSeconds<u64>")]
     #[configurable(metadata(docs::examples = 150000, docs::examples = 450000))]
     #[serde(default = "default_message_timeout_ms")]
+    #[configurable(metadata(docs::human_name = "Message Timeout"))]
     #[configurable(metadata(docs::advanced))]
     pub message_timeout_ms: Duration,
 
@@ -104,17 +111,17 @@ pub struct KafkaSinkConfig {
 
     /// The log field name to use for the Kafka headers.
     ///
-    /// If omitted, no headers will be written.
+    /// If omitted, no headers are written.
     #[configurable(metadata(docs::advanced))]
     #[serde(alias = "headers_field")] // accidentally released as `headers_field` in 0.18
     #[configurable(metadata(docs::examples = "headers"))]
-    pub headers_key: Option<String>,
+    pub headers_key: Option<ConfigTargetPath>,
 
     #[configurable(derived)]
     #[serde(
         default,
         deserialize_with = "crate::serde::bool_or_struct",
-        skip_serializing_if = "crate::serde::skip_serializing_if_default"
+        skip_serializing_if = "crate::serde::is_default"
     )]
     pub acknowledgements: AcknowledgementsConfig,
 }
@@ -128,111 +135,92 @@ const fn default_message_timeout_ms() -> Duration {
 }
 
 fn example_librdkafka_options() -> HashMap<String, String> {
-    HashMap::<_, _>::from_iter(
-        [
-            ("client.id".to_string(), "${ENV_VAR}".to_string()),
-            ("fetch.error.backoff.ms".to_string(), "1000".to_string()),
-            ("socket.send.buffer.bytes".to_string(), "100".to_string()),
-        ]
-        .into_iter(),
-    )
-}
-
-/// Used to determine the options to set in configs, since both Kafka consumers and producers have
-/// unique options, they use the same struct, and the error if given the wrong options.
-#[derive(Debug, PartialOrd, PartialEq, Eq)]
-pub enum KafkaRole {
-    Consumer,
-    Producer,
+    HashMap::<_, _>::from_iter([
+        ("client.id".to_string(), "${ENV_VAR}".to_string()),
+        ("fetch.error.backoff.ms".to_string(), "1000".to_string()),
+        ("socket.send.buffer.bytes".to_string(), "100".to_string()),
+    ])
 }
 
 impl KafkaSinkConfig {
-    pub(crate) fn to_rdkafka(&self, kafka_role: KafkaRole) -> crate::Result<ClientConfig> {
+    pub(crate) fn to_rdkafka(&self) -> crate::Result<ClientConfig> {
         let mut client_config = ClientConfig::new();
         client_config
             .set("bootstrap.servers", &self.bootstrap_servers)
             .set(
                 "socket.timeout.ms",
-                &self.socket_timeout_ms.as_millis().to_string(),
+                self.socket_timeout_ms.as_millis().to_string(),
             )
             .set("statistics.interval.ms", "1000");
 
         self.auth.apply(&mut client_config)?;
 
-        match kafka_role {
-            // All batch options are producer only.
-            KafkaRole::Producer => {
-                client_config
-                    .set("compression.codec", &to_string(self.compression))
-                    .set(
-                        "message.timeout.ms",
-                        &self.message_timeout_ms.as_millis().to_string(),
-                    );
+        // All batch options are producer only.
+        client_config
+            .set("compression.codec", to_string(self.compression))
+            .set(
+                "message.timeout.ms",
+                self.message_timeout_ms.as_millis().to_string(),
+            );
 
-                if let Some(value) = self.batch.timeout_secs {
-                    // Delay in milliseconds to wait for messages in the producer queue to accumulate before
-                    // constructing message batches (MessageSets) to transmit to brokers. A higher value
-                    // allows larger and more effective (less overhead, improved compression) batches of
-                    // messages to accumulate at the expense of increased message delivery latency.
-                    // Type: float
-                    let key = "queue.buffering.max.ms";
-                    if let Some(val) = self.librdkafka_options.get(key) {
-                        return Err(format!("Batching setting `batch.timeout_secs` sets `librdkafka_options.{}={}`.\
-                                        The config already sets this as `librdkafka_options.queue.buffering.max.ms={}`.\
-                                        Please delete one.", key, value, val).into());
-                    }
-                    debug!(
-                        librdkafka_option = key,
-                        batch_option = "timeout_secs",
-                        value,
-                        "Applying batch option as librdkafka option."
-                    );
-                    client_config.set(key, &((value * 1000.0).round().to_string()));
-                }
-                if let Some(value) = self.batch.max_events {
-                    // Maximum number of messages batched in one MessageSet. The total MessageSet size is
-                    // also limited by batch.size and message.max.bytes.
-                    // Type: integer
-                    let key = "batch.num.messages";
-                    if let Some(val) = self.librdkafka_options.get(key) {
-                        return Err(format!("Batching setting `batch.max_events` sets `librdkafka_options.{}={}`.\
-                                        The config already sets this as `librdkafka_options.batch.num.messages={}`.\
-                                        Please delete one.", key, value, val).into());
-                    }
-                    debug!(
-                        librdkafka_option = key,
-                        batch_option = "max_events",
-                        value,
-                        "Applying batch option as librdkafka option."
-                    );
-                    client_config.set(key, &value.to_string());
-                }
-                if let Some(value) = self.batch.max_bytes {
-                    // Maximum size (in bytes) of all messages batched in one MessageSet, including protocol
-                    // framing overhead. This limit is applied after the first message has been added to the
-                    // batch, regardless of the first message's size, this is to ensure that messages that
-                    // exceed batch.size are produced. The total MessageSet size is also limited by
-                    // batch.num.messages and message.max.bytes.
-                    // Type: integer
-                    let key = "batch.size";
-                    if let Some(val) = self.librdkafka_options.get(key) {
-                        return Err(format!("Batching setting `batch.max_bytes` sets `librdkafka_options.{}={}`.\
-                                        The config already sets this as `librdkafka_options.batch.size={}`.\
-                                        Please delete one.", key, value, val).into());
-                    }
-                    debug!(
-                        librdkafka_option = key,
-                        batch_option = "max_bytes",
-                        value,
-                        "Applying batch option as librdkafka option."
-                    );
-                    client_config.set(key, &value.to_string());
-                }
+        if let Some(value) = self.batch.timeout_secs {
+            // Delay in milliseconds to wait for messages in the producer queue to accumulate before
+            // constructing message batches (MessageSets) to transmit to brokers. A higher value
+            // allows larger and more effective (less overhead, improved compression) batches of
+            // messages to accumulate at the expense of increased message delivery latency.
+            // Type: float
+            let key = "queue.buffering.max.ms";
+            if let Some(val) = self.librdkafka_options.get(key) {
+                return Err(format!("Batching setting `batch.timeout_secs` sets `librdkafka_options.{key}={value}`.\
+                                    The config already sets this as `librdkafka_options.queue.buffering.max.ms={val}`.\
+                                    Please delete one.").into());
             }
-
-            KafkaRole::Consumer => {
-                client_config.set("queued.min.messages", QUEUED_MIN_MESSAGES.to_string());
+            debug!(
+                librdkafka_option = key,
+                batch_option = "timeout_secs",
+                value,
+                "Applying batch option as librdkafka option."
+            );
+            client_config.set(key, (value * 1000.0).round().to_string());
+        }
+        if let Some(value) = self.batch.max_events {
+            // Maximum number of messages batched in one MessageSet. The total MessageSet size is
+            // also limited by batch.size and message.max.bytes.
+            // Type: integer
+            let key = "batch.num.messages";
+            if let Some(val) = self.librdkafka_options.get(key) {
+                return Err(format!("Batching setting `batch.max_events` sets `librdkafka_options.{key}={value}`.\
+                                    The config already sets this as `librdkafka_options.batch.num.messages={val}`.\
+                                    Please delete one.").into());
             }
+            debug!(
+                librdkafka_option = key,
+                batch_option = "max_events",
+                value,
+                "Applying batch option as librdkafka option."
+            );
+            client_config.set(key, value.to_string());
+        }
+        if let Some(value) = self.batch.max_bytes {
+            // Maximum size (in bytes) of all messages batched in one MessageSet, including protocol
+            // framing overhead. This limit is applied after the first message has been added to the
+            // batch, regardless of the first message's size, this is to ensure that messages that
+            // exceed batch.size are produced. The total MessageSet size is also limited by
+            // batch.num.messages and message.max.bytes.
+            // Type: integer
+            let key = "batch.size";
+            if let Some(val) = self.librdkafka_options.get(key) {
+                return Err(format!("Batching setting `batch.max_bytes` sets `librdkafka_options.{key}={value}`.\
+                                    The config already sets this as `librdkafka_options.batch.size={val}`.\
+                                    Please delete one.").into());
+            }
+            debug!(
+                librdkafka_option = key,
+                batch_option = "max_bytes",
+                value,
+                "Applying batch option as librdkafka option."
+            );
+            client_config.set(key, value.to_string());
         }
 
         for (key, value) in self.librdkafka_options.iter() {
@@ -249,7 +237,8 @@ impl GenerateConfig for KafkaSinkConfig {
         toml::Value::try_from(Self {
             bootstrap_servers: "10.14.22.123:9092,10.14.23.332:9092".to_owned(),
             topic: Template::try_from("topic-1234".to_owned()).unwrap(),
-            key_field: Some("user_id".to_owned()),
+            healthcheck_topic: None,
+            key_field: Some(ConfigTargetPath::try_from("user_id".to_owned()).unwrap()),
             encoding: JsonSerializerConfig::default().into(),
             batch: Default::default(),
             compression: KafkaCompression::None,
@@ -265,6 +254,7 @@ impl GenerateConfig for KafkaSinkConfig {
 }
 
 #[async_trait::async_trait]
+#[typetag::serde(name = "kafka")]
 impl SinkConfig for KafkaSinkConfig {
     async fn build(&self, _cx: SinkContext) -> crate::Result<(VectorSink, Healthcheck)> {
         let sink = KafkaSink::new(self.clone())?;

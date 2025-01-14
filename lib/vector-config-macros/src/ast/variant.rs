@@ -1,7 +1,7 @@
 use darling::{error::Accumulator, util::Flag, FromAttributes};
-use proc_macro2::Ident;
+use proc_macro2::{Ident, TokenStream};
+use quote::ToTokens;
 use serde_derive_internals::ast as serde_ast;
-use syn::spanned::Spanned;
 
 use super::{
     util::{try_extract_doc_title_description, DarlingResultIterator},
@@ -26,7 +26,7 @@ impl<'a> Variant<'a> {
         is_virtual_newtype: bool,
     ) -> darling::Result<Variant<'a>> {
         let original = serde.original;
-        let name = serde.attrs.name().deserialize_name();
+        let name = serde.attrs.name().deserialize_name().to_string();
         let style = serde.style.into();
         let is_newtype_wrapper_field = style == Style::Newtype;
 
@@ -140,7 +140,7 @@ impl<'a> Variant<'a> {
     /// standard `#[deprecated]` attribute, neither automatically applying it nor deriving the
     /// deprecation status of a variant when it is present.
     pub fn deprecated(&self) -> bool {
-        self.attrs.deprecated.is_some()
+        self.attrs.deprecated.is_present()
     }
 
     /// Whether or not this variant is visible during either serialization or deserialization.
@@ -166,9 +166,9 @@ impl<'a> Variant<'a> {
     }
 }
 
-impl<'a> Spanned for Variant<'a> {
-    fn span(&self) -> proc_macro2::Span {
-        self.original.span()
+impl ToTokens for Variant<'_> {
+    fn to_tokens(&self, tokens: &mut TokenStream) {
+        self.original.to_tokens(tokens)
     }
 }
 
@@ -204,7 +204,7 @@ impl Attributes {
     }
 }
 
-impl<'a> PartialEq for Variant<'a> {
+impl PartialEq for Variant<'_> {
     fn eq(&self, other: &Self) -> bool {
         // Equality checking between variants is only used to drive conformance checks around making
         // sure no duplicate variants exist when in untagged mode, so all we care about is what

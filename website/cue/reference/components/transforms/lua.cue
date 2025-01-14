@@ -63,6 +63,7 @@ components: transforms: lua: {
 						-- Add root level field
 						event.log.field = "new value"
 						-- Add nested field
+						event.log.nested = {}
 						event.log.nested.field = "nested value"
 						-- Rename field
 						event.log.renamed_field = event.log.field_to_rename
@@ -308,7 +309,6 @@ components: transforms: lua: {
 	}
 
 	telemetry: metrics: {
-		lua_memory_used_bytes:   components.sources.internal_metrics.output.metrics.lua_memory_used_bytes
-		processing_errors_total: components.sources.internal_metrics.output.metrics.processing_errors_total
+		lua_memory_used_bytes: components.sources.internal_metrics.output.metrics.lua_memory_used_bytes
 	}
 }

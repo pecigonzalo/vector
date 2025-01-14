@@ -14,9 +14,9 @@ base: components: sinks: elasticsearch: configuration: {
 			description: """
 				Whether or not end-to-end acknowledgements are enabled.
 
-				When enabled for a sink, any source connected to that sink, where the source supports
-				end-to-end acknowledgements as well, will wait for events to be acknowledged by the sink
-				before acknowledging them at the source.
+				When enabled for a sink, any source connected to that sink where the source supports
+				end-to-end acknowledgements as well, waits for events to be acknowledged by **all
+				connected** sinks before acknowledging them at the source.
 
 				Enabling or disabling acknowledgements at the sink level takes precedence over any global
 				[`acknowledgements`][global_acks] configuration.
@@ -28,8 +28,12 @@ base: components: sinks: elasticsearch: configuration: {
 		}
 	}
 	api_version: {
-		description: "The API version of Elasticsearch."
-		required:    false
+		description: """
+			The API version of Elasticsearch.
+
+			Amazon OpenSearch Serverless requires this option to be set to `auto` (the default).
+			"""
+		required: false
 		type: string: {
 			default: "auto"
 			enum: {
@@ -38,8 +42,8 @@ base: components: sinks: elasticsearch: configuration: {
 
 					If the [cluster state version endpoint][es_version] isn't reachable, a warning is logged to
 					stdout, and the version is assumed to be V6 if the `suppress_type_name` option is set to
-					true. Otherwise, the version is assumed to be V8. In the future, the sink will instead
-					return an Error during configuration parsing, since a wronly assumed version could lead to
+					`true`. Otherwise, the version is assumed to be V8. In the future, the sink instead
+					returns an error during configuration parsing, since a wrongly assumed version could lead to
 					incorrect API calls.
 
 					[es_version]: https://www.elastic.co/guide/en/elasticsearch/reference/current/cluster-state.html#cluster-state-api-path-params
@@ -75,6 +79,16 @@ base: components: sinks: elasticsearch: configuration: {
 				relevant_when: "strategy = \"aws\""
 				required:      true
 				type: string: examples: ["/my/aws/credentials"]
+			}
+			external_id: {
+				description: """
+					The optional unique external ID in conjunction with role to assume.
+
+					[external_id]: https://docs.aws.amazon.com/IAM/latest/UserGuide/id_roles_create_for-user_externalid.html
+					"""
+				relevant_when: "strategy = \"aws\""
+				required:      false
+				type: string: examples: ["randomEXAMPLEidString"]
 			}
 			imds: {
 				description:   "Configuration for authenticating with AWS through IMDS."
@@ -156,8 +170,12 @@ base: components: sinks: elasticsearch: configuration: {
 				type: string: examples: ["wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"]
 			}
 			strategy: {
-				description: "The authentication strategy to use."
-				required:    true
+				description: """
+					The authentication strategy to use.
+
+					Amazon OpenSearch Serverless requires this option to be set to `aws`.
+					"""
+				required: true
 				type: string: enum: {
 					aws:   "Amazon OpenSearch Service-specific authentication."
 					basic: "HTTP Basic Authentication."
@@ -197,10 +215,10 @@ base: components: sinks: elasticsearch: configuration: {
 		type: object: options: {
 			max_bytes: {
 				description: """
-					The maximum size of a batch that will be processed by a sink.
+					The maximum size of a batch that is processed by a sink.
 
 					This is based on the uncompressed size of the batched events, before they are
-					serialized / compressed.
+					serialized/compressed.
 					"""
 				required: false
 				type: uint: {
@@ -231,7 +249,7 @@ base: components: sinks: elasticsearch: configuration: {
 				description: """
 					Action to use when making requests to the [Elasticsearch Bulk API][es_bulk].
 
-					Currently, Vector only supports `index` and `create`. `update` and `delete` actions are not supported.
+					Only `index`, `create` and `update` actions are supported.
 
 					[es_bulk]: https://www.elastic.co/guide/en/elasticsearch/reference/current/docs-bulk.html
 					"""
@@ -249,6 +267,38 @@ base: components: sinks: elasticsearch: configuration: {
 					default: "vector-%Y.%m.%d"
 					examples: ["application-{{ application_id }}-%Y-%m-%d", "{{ index }}"]
 					syntax: "template"
+				}
+			}
+			template_fallback_index: {
+				description: "The default index to write events to if the template in `bulk.index` cannot be resolved"
+				required:    false
+				type: string: examples: ["test-index"]
+			}
+			version: {
+				description: "Version field value."
+				required:    false
+				type: string: {
+					examples: ["{{ obj_version }}-%Y-%m-%d", "123"]
+					syntax: "template"
+				}
+			}
+			version_type: {
+				description: """
+					Version type.
+
+					Possible values are `internal`, `external` or `external_gt` and `external_gte`.
+
+					[es_index_versioning]: https://www.elastic.co/guide/en/elasticsearch/reference/current/docs-index_.html#index-versioning
+					"""
+				required: false
+				type: string: {
+					default: "internal"
+					enum: {
+						external:     "The `external` or `external_gt` type."
+						external_gte: "The `external_gte` type."
+						internal:     "The `internal` type."
+					}
+					examples: ["internal", "external"]
 				}
 			}
 		}
@@ -269,10 +319,20 @@ base: components: sinks: elasticsearch: configuration: {
 					[gzip]: https://www.gzip.org/
 					"""
 				none: "No compression."
+				snappy: """
+					[Snappy][snappy] compression.
+
+					[snappy]: https://github.com/google/snappy/blob/main/docs/README.md
+					"""
 				zlib: """
 					[Zlib][zlib] compression.
 
 					[zlib]: https://zlib.net/
+					"""
+				zstd: """
+					[Zstandard][zstd] compression.
+
+					[zstd]: https://facebook.github.io/zstd/
 					"""
 			}
 		}
@@ -289,8 +349,8 @@ base: components: sinks: elasticsearch: configuration: {
 					from the `data_stream` configuration field of the same name.
 
 					If enabled, the value of the `data_stream.type`, `data_stream.dataset`, and
-					`data_stream.namespace` event fields will be used if they are present. Otherwise, the values
-					set here in the configuration will be used.
+					`data_stream.namespace` event fields are used if they are present. Otherwise, the values
+					set in this configuration are used.
 					"""
 				required: false
 				type: bool: default: true
@@ -372,12 +432,12 @@ base: components: sinks: elasticsearch: configuration: {
 		required:    false
 		type: object: options: {
 			except_fields: {
-				description: "List of fields that will be excluded from the encoded event."
+				description: "List of fields that are excluded from the encoded event."
 				required:    false
 				type: array: items: type: string: {}
 			}
 			only_fields: {
-				description: "List of fields that will be included in the encoded event."
+				description: "List of fields that are included in the encoded event."
 				required:    false
 				type: array: items: type: string: {}
 			}
@@ -385,8 +445,12 @@ base: components: sinks: elasticsearch: configuration: {
 				description: "Format used for timestamp fields."
 				required:    false
 				type: string: enum: {
-					rfc3339: "Represent the timestamp as a RFC 3339 timestamp."
-					unix:    "Represent the timestamp as a Unix timestamp."
+					rfc3339:    "Represent the timestamp as a RFC 3339 timestamp."
+					unix:       "Represent the timestamp as a Unix timestamp."
+					unix_float: "Represent the timestamp as a Unix timestamp in floating point."
+					unix_ms:    "Represent the timestamp as a Unix timestamp in milliseconds."
+					unix_ns:    "Represent the timestamp as a Unix timestamp in nanoseconds."
+					unix_us:    "Represent the timestamp as a Unix timestamp in microseconds"
 				}
 			}
 		}
@@ -437,7 +501,7 @@ base: components: sinks: elasticsearch: configuration: {
 				description: """
 					Name of the tag in the metric to use for the source host.
 
-					If present, the value of the tag is set on the generated log event in the "host" field,
+					If present, the value of the tag is set on the generated log event in the `host` field,
 					where the field key uses the [global `host_key` option][global_log_schema_host_key].
 
 					[global_log_schema_host_key]: https://vector.dev/docs/reference/configuration//global-options#log_schema.host_key
@@ -490,12 +554,23 @@ base: components: sinks: elasticsearch: configuration: {
 		type: string: {
 			default: "bulk"
 			enum: {
-				bulk: "Ingests documents in bulk, via the bulk API `index` action."
+				bulk: "Ingests documents in bulk, using the bulk API `index` action."
 				data_stream: """
-					Ingests documents in bulk, via the bulk API `create` action.
+					Ingests documents in bulk, using the bulk API `create` action.
 
 					Elasticsearch Data Streams only support the `create` action.
 					"""
+			}
+		}
+	}
+	opensearch_service_type: {
+		description: "Amazon OpenSearch service type"
+		required:    false
+		type: string: {
+			default: "managed"
+			enum: {
+				managed:    "Elasticsearch or OpenSearch Managed domain"
+				serverless: "OpenSearch Serverless collection"
 			}
 		}
 	}
@@ -538,7 +613,7 @@ base: components: sinks: elasticsearch: configuration: {
 																Valid values are greater than `0` and less than `1`. Smaller values cause the algorithm to scale back rapidly
 																when latency increases.
 
-																Note that the new limit is rounded down after applying this ratio.
+																**Note**: The new limit is rounded down after applying this ratio.
 																"""
 						required: false
 						type: float: default: 0.9
@@ -555,6 +630,26 @@ base: components: sinks: elasticsearch: configuration: {
 																"""
 						required: false
 						type: float: default: 0.4
+					}
+					initial_concurrency: {
+						description: """
+																The initial concurrency limit to use. If not specified, the initial limit is 1 (no concurrency).
+
+																Datadog recommends setting this value to your service's average limit if you're seeing that it takes a
+																long time to ramp up adaptive concurrency after a restart. You can find this value by looking at the
+																`adaptive_concurrency_limit` metric.
+																"""
+						required: false
+						type: uint: default: 1
+					}
+					max_concurrency_limit: {
+						description: """
+																The maximum concurrency limit.
+
+																The adaptive request concurrency limit does not go above this bound. This is put in place as a safeguard.
+																"""
+						required: false
+						type: uint: default: 200
 					}
 					rtt_deviation_scale: {
 						description: """
@@ -573,14 +668,19 @@ base: components: sinks: elasticsearch: configuration: {
 				}
 			}
 			concurrency: {
-				description: "Configuration for outbound request concurrency."
-				required:    false
+				description: """
+					Configuration for outbound request concurrency.
+
+					This can be set either to one of the below enum values or to a positive integer, which denotes
+					a fixed concurrency limit.
+					"""
+				required: false
 				type: {
 					string: {
-						default: "none"
+						default: "adaptive"
 						enum: {
 							adaptive: """
-															Concurrency will be managed by Vector's [Adaptive Request Concurrency][arc] feature.
+															Concurrency is managed by Vector's [Adaptive Request Concurrency][arc] feature.
 
 															[arc]: https://vector.dev/docs/about/under-the-hood/networking/arc/
 															"""
@@ -626,12 +726,8 @@ base: components: sinks: elasticsearch: configuration: {
 				}
 			}
 			retry_attempts: {
-				description: """
-					The maximum number of retries to make for failed requests.
-
-					The default, for all intents and purposes, represents an infinite number of retries.
-					"""
-				required: false
+				description: "The maximum number of retries to make for failed requests."
+				required:    false
 				type: uint: {
 					default: 9223372036854775807
 					unit:    "retries"
@@ -641,7 +737,7 @@ base: components: sinks: elasticsearch: configuration: {
 				description: """
 					The amount of time to wait before attempting the first retry for a failed request.
 
-					After the first retry has failed, the fibonacci sequence will be used to select future backoffs.
+					After the first retry has failed, the fibonacci sequence is used to select future backoffs.
 					"""
 				required: false
 				type: uint: {
@@ -649,11 +745,31 @@ base: components: sinks: elasticsearch: configuration: {
 					unit:    "seconds"
 				}
 			}
+			retry_jitter_mode: {
+				description: "The jitter mode to use for retry backoff behavior."
+				required:    false
+				type: string: {
+					default: "Full"
+					enum: {
+						Full: """
+															Full jitter.
+
+															The random delay is anywhere from 0 up to the maximum current delay calculated by the backoff
+															strategy.
+
+															Incorporating full jitter into your backoff strategy can greatly reduce the likelihood
+															of creating accidental denial of service (DoS) conditions against your own systems when
+															many clients are recovering from a failure state.
+															"""
+						None: "No jitter."
+					}
+				}
+			}
 			retry_max_duration_secs: {
 				description: "The maximum amount of time to wait between retries."
 				required:    false
 				type: uint: {
-					default: 3600
+					default: 30
 					unit:    "seconds"
 				}
 			}
@@ -661,7 +777,7 @@ base: components: sinks: elasticsearch: configuration: {
 				description: """
 					The time a request can take before being aborted.
 
-					It is highly recommended that you do not lower this value below the service’s internal timeout, as this could
+					Datadog highly recommends that you do not lower this value below the service's internal timeout, as this could
 					create orphaned requests, pile on retries, and result in duplicate data downstream.
 					"""
 				required: false
@@ -689,7 +805,7 @@ base: components: sinks: elasticsearch: configuration: {
 
 			The `type` field was deprecated in Elasticsearch 7.x and removed in Elasticsearch 8.x.
 
-			If enabled, the `doc_type` option will be ignored.
+			If enabled, the `doc_type` option is ignored.
 			"""
 		required: false
 		type: bool: default: false
@@ -747,16 +863,25 @@ base: components: sinks: elasticsearch: configuration: {
 				required: false
 				type: string: examples: ["${KEY_PASS_ENV_VAR}", "PassWord1"]
 			}
+			server_name: {
+				description: """
+					Server name to use when using Server Name Indication (SNI).
+
+					Only relevant for outgoing connections.
+					"""
+				required: false
+				type: string: examples: ["www.example.com"]
+			}
 			verify_certificate: {
 				description: """
-					Enables certificate verification.
+					Enables certificate verification. For components that create a server, this requires that the
+					client connections have a valid client certificate. For components that initiate requests,
+					this validates that the upstream has a valid certificate.
 
 					If enabled, certificates must not be expired and must be issued by a trusted
 					issuer. This verification operates in a hierarchical manner, checking that the leaf certificate (the
 					certificate presented by the client/server) is not only valid, but that the issuer of that certificate is also valid, and
 					so on until the verification process reaches a root certificate.
-
-					Relevant for both incoming and outgoing connections.
 
 					Do NOT set this to `false` unless you understand the risks of not verifying the validity of certificates.
 					"""

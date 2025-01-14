@@ -1,6 +1,4 @@
-use ::value::Value;
 use vrl::prelude::*;
-use vrl::state::TypeState;
 
 fn set_secret(
     ctx: &mut Context,
@@ -72,6 +70,6 @@ impl FunctionExpression for SetSecretFn {
     }
 
     fn type_def(&self, _: &TypeState) -> TypeDef {
-        TypeDef::null().infallible()
+        TypeDef::null().infallible().impure()
     }
 }

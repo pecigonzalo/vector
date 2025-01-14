@@ -1,59 +1,58 @@
 #![allow(missing_docs)]
-#[cfg(feature = "api")]
-use std::sync::{atomic::AtomicBool, Arc};
-use std::{collections::HashMap, num::NonZeroUsize, path::PathBuf};
+use std::{
+    num::{NonZeroU64, NonZeroUsize},
+    path::PathBuf,
+    process::ExitStatus,
+    sync::atomic::{AtomicUsize, Ordering},
+    time::Duration,
+};
 
 use exitcode::ExitCode;
 use futures::StreamExt;
-#[cfg(feature = "enterprise")]
-use futures_util::future::BoxFuture;
-use once_cell::race::OnceNonZeroUsize;
-use tokio::{
-    runtime::{self, Runtime},
-    sync::mpsc,
-};
+use tokio::runtime::{self, Runtime};
+use tokio::sync::{broadcast::error::RecvError, MutexGuard};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 
-#[cfg(feature = "enterprise")]
-use crate::config::enterprise::{
-    attach_enterprise_components, report_configuration, report_on_reload, EnterpriseError,
-    EnterpriseMetadata, EnterpriseReporter,
-};
-#[cfg(not(feature = "enterprise-tests"))]
-use crate::metrics;
+use crate::extra_context::ExtraContext;
 #[cfg(feature = "api")]
 use crate::{api, internal_events::ApiStarted};
 use crate::{
-    cli::{handle_config_errors, LogFormat, Opts, RootOpts},
+    cli::{handle_config_errors, LogFormat, Opts, RootOpts, WatchConfigMethod},
     config::{self, Config, ConfigPath},
     heartbeat,
+    internal_events::{VectorConfigLoadError, VectorQuit, VectorStarted, VectorStopped},
     signal::{SignalHandler, SignalPair, SignalRx, SignalTo},
-    topology::{self, RunningTopology},
+    topology::{
+        ReloadOutcome, RunningTopology, SharedTopologyController, ShutdownErrorReceiver,
+        TopologyController,
+    },
     trace,
 };
 
-pub static WORKER_THREADS: OnceNonZeroUsize = OnceNonZeroUsize::new();
+#[cfg(unix)]
+use std::os::unix::process::ExitStatusExt;
+#[cfg(windows)]
+use std::os::windows::process::ExitStatusExt;
+use tokio::runtime::Handle;
 
-use crate::internal_events::{
-    VectorConfigLoadError, VectorQuit, VectorRecoveryError, VectorReloadError, VectorReloaded,
-    VectorStarted, VectorStopped,
-};
+static WORKER_THREADS: AtomicUsize = AtomicUsize::new(0);
 
-use tokio::sync::broadcast::error::RecvError;
+pub fn worker_threads() -> Option<NonZeroUsize> {
+    NonZeroUsize::new(WORKER_THREADS.load(Ordering::Relaxed))
+}
 
 pub struct ApplicationConfig {
     pub config_paths: Vec<config::ConfigPath>,
     pub topology: RunningTopology,
-    pub graceful_crash_sender: mpsc::UnboundedSender<()>,
-    pub graceful_crash_receiver: mpsc::UnboundedReceiver<()>,
+    pub graceful_crash_receiver: ShutdownErrorReceiver,
+    pub internal_topologies: Vec<RunningTopology>,
     #[cfg(feature = "api")]
     pub api: config::api::Options,
-    #[cfg(feature = "enterprise")]
-    pub enterprise: Option<EnterpriseReporter<BoxFuture<'static, ()>>>,
+    pub extra_context: ExtraContext,
 }
 
 pub struct Application {
-    pub require_healthy: Option<bool>,
+    pub root_opts: RootOpts,
     pub config: ApplicationConfig,
     pub signals: SignalPair,
 }
@@ -62,79 +61,99 @@ impl ApplicationConfig {
     pub async fn from_opts(
         opts: &RootOpts,
         signal_handler: &mut SignalHandler,
+        extra_context: ExtraContext,
     ) -> Result<Self, ExitCode> {
         let config_paths = opts.config_paths_with_formats();
 
+        let graceful_shutdown_duration = (!opts.no_graceful_shutdown_limit)
+            .then(|| Duration::from_secs(u64::from(opts.graceful_shutdown_limit_secs)));
+
+        let watcher_conf = if opts.watch_config {
+            Some(watcher_config(
+                opts.watch_config_method,
+                opts.watch_config_poll_interval_seconds,
+            ))
+        } else {
+            None
+        };
+
         let config = load_configs(
             &config_paths,
-            opts.watch_config,
+            watcher_conf,
             opts.require_healthy,
+            opts.allow_empty_config,
+            graceful_shutdown_duration,
             signal_handler,
         )
         .await?;
 
-        Self::from_config(config_paths, config).await
+        Self::from_config(config_paths, config, extra_context).await
     }
 
     pub async fn from_config(
         config_paths: Vec<ConfigPath>,
         config: Config,
+        extra_context: ExtraContext,
     ) -> Result<Self, ExitCode> {
-        // This is ugly, but needed to allow `config` to be mutable for building the enterprise
-        // features, but also avoid a "does not need to be mutable" warning when the enterprise
-        // feature is not enabled.
-        #[cfg(feature = "enterprise")]
-        let mut config = config;
-        #[cfg(feature = "enterprise")]
-        let enterprise = build_enterprise(&mut config, config_paths.clone())?;
-
-        let diff = config::ConfigDiff::initial(&config);
-        let pieces = topology::build_or_log_errors(&config, &diff, HashMap::new())
-            .await
-            .ok_or(exitcode::CONFIG)?;
-
         #[cfg(feature = "api")]
         let api = config.api;
 
-        let result = topology::start_validated(config, diff, pieces).await;
-        let (topology, (graceful_crash_sender, graceful_crash_receiver)) =
-            result.ok_or(exitcode::CONFIG)?;
+        let (topology, graceful_crash_receiver) =
+            RunningTopology::start_init_validated(config, extra_context.clone())
+                .await
+                .ok_or(exitcode::CONFIG)?;
 
         Ok(Self {
             config_paths,
             topology,
-            graceful_crash_sender,
             graceful_crash_receiver,
+            internal_topologies: Vec::new(),
             #[cfg(feature = "api")]
             api,
-            #[cfg(feature = "enterprise")]
-            enterprise,
+            extra_context,
         })
+    }
+
+    pub async fn add_internal_config(
+        &mut self,
+        config: Config,
+        extra_context: ExtraContext,
+    ) -> Result<(), ExitCode> {
+        let Some((topology, _)) =
+            RunningTopology::start_init_validated(config, extra_context).await
+        else {
+            return Err(exitcode::CONFIG);
+        };
+        self.internal_topologies.push(topology);
+        Ok(())
     }
 
     /// Configure the API server, if applicable
     #[cfg(feature = "api")]
-    pub fn setup_api(&self, runtime: &Runtime) -> Option<api::Server> {
+    pub fn setup_api(&self, handle: &Handle) -> Option<api::Server> {
         if self.api.enabled {
-            let api_server = api::Server::start(
+            match api::Server::start(
                 self.topology.config(),
                 self.topology.watch(),
-                Arc::<AtomicBool>::clone(&self.topology.running),
-                runtime,
-            );
-
-            match api_server {
+                std::sync::Arc::clone(&self.topology.running),
+                handle,
+            ) {
                 Ok(api_server) => {
                     emit!(ApiStarted {
                         addr: self.api.address.unwrap(),
-                        playground: self.api.playground
+                        playground: self.api.playground,
+                        graphql: self.api.graphql
                     });
 
                     Some(api_server)
                 }
-                Err(e) => {
-                    error!("An error occurred that Vector couldn't handle: {}.", e);
-                    let _ = self.graceful_crash_sender.send(());
+                Err(error) => {
+                    let error = error.to_string();
+                    error!("An error occurred that Vector couldn't handle: {}.", error);
+                    _ = self
+                        .topology
+                        .abort_tx
+                        .send(crate::signal::ShutdownError::ApiFailed { error });
                     None
                 }
             }
@@ -146,28 +165,35 @@ impl ApplicationConfig {
 }
 
 impl Application {
-    pub fn run() {
-        let (runtime, app) = Self::prepare_start().unwrap_or_else(|code| std::process::exit(code));
+    pub fn run(extra_context: ExtraContext) -> ExitStatus {
+        let (runtime, app) =
+            Self::prepare_start(extra_context).unwrap_or_else(|code| std::process::exit(code));
 
-        runtime.block_on(app.run());
+        runtime.block_on(app.run())
     }
 
-    pub fn prepare_start() -> Result<(Runtime, StartedApplication), ExitCode> {
-        Self::prepare().and_then(|(runtime, app)| app.start(&runtime).map(|app| (runtime, app)))
+    pub fn prepare_start(
+        extra_context: ExtraContext,
+    ) -> Result<(Runtime, StartedApplication), ExitCode> {
+        Self::prepare(extra_context)
+            .and_then(|(runtime, app)| app.start(runtime.handle()).map(|app| (runtime, app)))
     }
 
-    pub fn prepare() -> Result<(Runtime, Self), ExitCode> {
+    pub fn prepare(extra_context: ExtraContext) -> Result<(Runtime, Self), ExitCode> {
         let opts = Opts::get_matches().map_err(|error| {
             // Printing to stdout/err can itself fail; ignore it.
-            let _ = error.print();
+            _ = error.print();
             exitcode::USAGE
         })?;
 
-        Self::prepare_from_opts(opts)
+        Self::prepare_from_opts(opts, extra_context)
     }
 
-    pub fn prepare_from_opts(opts: Opts) -> Result<(Runtime, Self), ExitCode> {
-        init_global();
+    pub fn prepare_from_opts(
+        opts: Opts,
+        extra_context: ExtraContext,
+    ) -> Result<(Runtime, Self), ExitCode> {
+        opts.root.init_global();
 
         let color = opts.root.color.use_color();
 
@@ -177,6 +203,11 @@ impl Application {
             opts.log_level(),
             opts.root.internal_log_rate_limit,
         );
+
+        // Can only log this after initializing the logging subsystem
+        if opts.root.openssl_no_probe {
+            debug!(message = "Disabled probing and configuration of root certificate locations on the system for OpenSSL.");
+        }
 
         let runtime = build_runtime(opts.root.threads, "vector-worker")?;
 
@@ -190,60 +221,64 @@ impl Application {
         let config = runtime.block_on(ApplicationConfig::from_opts(
             &opts.root,
             &mut signals.handler,
+            extra_context,
         ))?;
 
         Ok((
             runtime,
             Self {
-                require_healthy: opts.root.require_healthy,
+                root_opts: opts.root,
                 config,
                 signals,
             },
         ))
     }
 
-    pub fn start(self, runtime: &Runtime) -> Result<StartedApplication, ExitCode> {
+    pub fn start(self, handle: &Handle) -> Result<StartedApplication, ExitCode> {
         // Any internal_logs sources will have grabbed a copy of the
         // early buffer by this point and set up a subscriber.
         crate::trace::stop_early_buffering();
 
         emit!(VectorStarted);
-        runtime.spawn(heartbeat::heartbeat());
+        handle.spawn(heartbeat::heartbeat());
 
         let Self {
-            require_healthy,
+            root_opts,
             config,
             signals,
         } = self;
 
-        let topology_controller = TopologyController {
+        let topology_controller = SharedTopologyController::new(TopologyController {
             #[cfg(feature = "api")]
-            api_server: config.setup_api(runtime),
+            api_server: config.setup_api(handle),
             topology: config.topology,
             config_paths: config.config_paths.clone(),
-            require_healthy,
-            #[cfg(feature = "enterprise")]
-            enterprise_reporter: config.enterprise,
-        };
+            require_healthy: root_opts.require_healthy,
+            extra_context: config.extra_context,
+        });
 
         Ok(StartedApplication {
             config_paths: config.config_paths,
+            internal_topologies: config.internal_topologies,
             graceful_crash_receiver: config.graceful_crash_receiver,
             signals,
             topology_controller,
+            allow_empty_config: root_opts.allow_empty_config,
         })
     }
 }
 
 pub struct StartedApplication {
-    config_paths: Vec<ConfigPath>,
-    graceful_crash_receiver: mpsc::UnboundedReceiver<()>,
+    pub config_paths: Vec<ConfigPath>,
+    pub internal_topologies: Vec<RunningTopology>,
+    pub graceful_crash_receiver: ShutdownErrorReceiver,
     pub signals: SignalPair,
-    topology_controller: TopologyController,
+    pub topology_controller: SharedTopologyController,
+    pub allow_empty_config: bool,
 }
 
 impl StartedApplication {
-    pub async fn run(self) {
+    pub async fn run(self) -> ExitStatus {
         self.main().await.shutdown().await
     }
 
@@ -252,7 +287,9 @@ impl StartedApplication {
             config_paths,
             graceful_crash_receiver,
             signals,
-            mut topology_controller,
+            topology_controller,
+            internal_topologies,
+            allow_empty_config,
         } = self;
 
         let mut graceful_crash = UnboundedReceiverStream::new(graceful_crash_receiver);
@@ -261,38 +298,23 @@ impl StartedApplication {
         let mut signal_rx = signals.receiver;
 
         let signal = loop {
+            let has_sources = !topology_controller.lock().await.topology.config.is_empty();
             tokio::select! {
-                signal = signal_rx.recv() => {
-                    match signal {
-                        Ok(SignalTo::ReloadFromConfigBuilder(config_builder)) => {
-                            let new_config = config_builder.build().map_err(handle_config_errors).ok();
-                            if let Some(signal) = topology_controller.reload(new_config).await {
-                                break signal;
-                            }
-                        }
-                        Ok(SignalTo::ReloadFromDisk) => {
-                            // Reload paths
-                            if let Some(paths) = config::process_paths(&config_paths) {
-                                topology_controller.config_paths = paths;
-                            }
-
-                            // Reload config
-                            let new_config = config::load_from_paths_with_provider_and_secrets(&topology_controller.config_paths, &mut signal_handler)
-                                .await
-                                .map_err(handle_config_errors).ok();
-
-                            if let Some(signal) = topology_controller.reload(new_config).await {
-                                break signal;
-                            }
-                        },
-                        Err(RecvError::Lagged(amt)) => warn!("Overflow, dropped {} signals.", amt),
-                        Err(RecvError::Closed) => break SignalTo::Shutdown,
-                        Ok(signal) => break signal,
-                    }
-                }
+                signal = signal_rx.recv() => if let Some(signal) = handle_signal(
+                    signal,
+                    &topology_controller,
+                    &config_paths,
+                    &mut signal_handler,
+                    allow_empty_config,
+                ).await {
+                    break signal;
+                },
                 // Trigger graceful shutdown if a component crashed, or all sources have ended.
-                _ = graceful_crash.next() => break SignalTo::Shutdown,
-                _ = topology_controller.sources_finished() => break SignalTo::Shutdown,
+                error = graceful_crash.next() => break SignalTo::Shutdown(error),
+                _ = TopologyController::sources_finished(topology_controller.clone()), if has_sources => {
+                    info!("All sources have finished.");
+                    break SignalTo::Shutdown(None)
+                } ,
                 else => unreachable!("Signal streams never end"),
             }
         };
@@ -301,195 +323,186 @@ impl StartedApplication {
             signal,
             signal_rx,
             topology_controller,
+            internal_topologies,
+        }
+    }
+}
+
+async fn handle_signal(
+    signal: Result<SignalTo, RecvError>,
+    topology_controller: &SharedTopologyController,
+    config_paths: &[ConfigPath],
+    signal_handler: &mut SignalHandler,
+    allow_empty_config: bool,
+) -> Option<SignalTo> {
+    match signal {
+        Ok(SignalTo::ReloadFromConfigBuilder(config_builder)) => {
+            let topology_controller = topology_controller.lock().await;
+            reload_config_from_result(topology_controller, config_builder.build()).await
+        }
+        Ok(SignalTo::ReloadFromDisk) => {
+            let mut topology_controller = topology_controller.lock().await;
+
+            // Reload paths
+            if let Some(paths) = config::process_paths(config_paths) {
+                topology_controller.config_paths = paths;
+            }
+
+            // Reload config
+            let new_config = config::load_from_paths_with_provider_and_secrets(
+                &topology_controller.config_paths,
+                signal_handler,
+                allow_empty_config,
+            )
+            .await;
+
+            reload_config_from_result(topology_controller, new_config).await
+        }
+        Err(RecvError::Lagged(amt)) => {
+            warn!("Overflow, dropped {} signals.", amt);
+            None
+        }
+        Err(RecvError::Closed) => Some(SignalTo::Shutdown(None)),
+        Ok(signal) => Some(signal),
+    }
+}
+
+async fn reload_config_from_result(
+    mut topology_controller: MutexGuard<'_, TopologyController>,
+    config: Result<Config, Vec<String>>,
+) -> Option<SignalTo> {
+    match config {
+        Ok(new_config) => match topology_controller.reload(new_config).await {
+            ReloadOutcome::FatalError(error) => Some(SignalTo::Shutdown(Some(error))),
+            _ => None,
+        },
+        Err(errors) => {
+            handle_config_errors(errors);
+            emit!(VectorConfigLoadError);
+            None
         }
     }
 }
 
 pub struct FinishedApplication {
-    signal: SignalTo,
-    signal_rx: SignalRx,
-    topology_controller: TopologyController,
+    pub signal: SignalTo,
+    pub signal_rx: SignalRx,
+    pub topology_controller: SharedTopologyController,
+    pub internal_topologies: Vec<RunningTopology>,
 }
 
 impl FinishedApplication {
-    pub async fn shutdown(self) {
+    pub async fn shutdown(self) -> ExitStatus {
         let FinishedApplication {
             signal,
-            mut signal_rx,
+            signal_rx,
             topology_controller,
+            internal_topologies,
         } = self;
 
-        match signal {
-            SignalTo::Shutdown => {
-                emit!(VectorStopped);
-                tokio::select! {
-                    _ = topology_controller.stop() => (), // Graceful shutdown finished
-                    _ = signal_rx.recv() => {
-                        // It is highly unlikely that this event will exit from topology.
-                        emit!(VectorQuit);
-                        // Dropping the shutdown future will immediately shut the server down
-                    }
-                }
-            }
-            SignalTo::Quit => {
-                // It is highly unlikely that this event will exit from topology.
-                emit!(VectorQuit);
-                drop(topology_controller);
-            }
+        // At this point, we'll have the only reference to the shared topology controller and can
+        // safely remove it from the wrapper to shut down the topology.
+        let topology_controller = topology_controller
+            .try_into_inner()
+            .expect("fail to unwrap topology controller")
+            .into_inner();
+
+        let status = match signal {
+            SignalTo::Shutdown(_) => Self::stop(topology_controller, signal_rx).await,
+            SignalTo::Quit => Self::quit(),
             _ => unreachable!(),
+        };
+
+        for topology in internal_topologies {
+            topology.stop().await;
         }
+
+        status
     }
-}
 
-struct TopologyController {
-    topology: RunningTopology,
-    config_paths: Vec<config::ConfigPath>,
-    require_healthy: Option<bool>,
-    #[cfg(feature = "enterprise")]
-    enterprise_reporter: Option<EnterpriseReporter<BoxFuture<'static, ()>>>,
-    #[cfg(feature = "api")]
-    api_server: Option<api::Server>,
-}
-
-impl TopologyController {
-    async fn reload(&mut self, new_config: Option<config::Config>) -> Option<SignalTo> {
-        if new_config.is_none() {
-            emit!(VectorConfigLoadError);
-            return None;
-        }
-        let mut new_config = new_config.unwrap();
-
-        new_config
-            .healthchecks
-            .set_require_healthy(self.require_healthy);
-
-        #[cfg(feature = "enterprise")]
-        // Augment config to enable observability within Datadog, if applicable.
-        match EnterpriseMetadata::try_from(&new_config) {
-            Ok(metadata) => {
-                if let Some(e) = report_on_reload(
-                    &mut new_config,
-                    metadata,
-                    self.config_paths.clone(),
-                    self.enterprise_reporter.as_ref(),
-                ) {
-                    self.enterprise_reporter = Some(e);
+    async fn stop(topology_controller: TopologyController, mut signal_rx: SignalRx) -> ExitStatus {
+        emit!(VectorStopped);
+        tokio::select! {
+            _ = topology_controller.stop() => ExitStatus::from_raw({
+                #[cfg(windows)]
+                {
+                    exitcode::OK as u32
                 }
-            }
-            Err(err) => {
-                if let EnterpriseError::MissingApiKey = err {
-                    emit!(VectorReloadError);
-                    return None;
-                }
-            }
+                #[cfg(unix)]
+                exitcode::OK
+            }), // Graceful shutdown finished
+            _ = signal_rx.recv() => Self::quit(),
         }
+    }
 
-        match self.topology.reload_config_and_respawn(new_config).await {
-            Ok(true) => {
-                #[cfg(feature = "api")]
-                // Pass the new config to the API server.
-                if let Some(ref api_server) = self.api_server {
-                    api_server.update_config(self.topology.config());
-                }
-
-                emit!(VectorReloaded {
-                    config_paths: &self.config_paths
-                })
+    fn quit() -> ExitStatus {
+        // It is highly unlikely that this event will exit from topology.
+        emit!(VectorQuit);
+        ExitStatus::from_raw({
+            #[cfg(windows)]
+            {
+                exitcode::UNAVAILABLE as u32
             }
-            Ok(false) => emit!(VectorReloadError),
-            // Trigger graceful shutdown for what remains of the topology
-            Err(()) => {
-                emit!(VectorReloadError);
-                emit!(VectorRecoveryError);
-                return Some(SignalTo::Shutdown);
-            }
-        }
-
-        None
+            #[cfg(unix)]
+            exitcode::OK
+        })
     }
-
-    async fn sources_finished(&self) {
-        self.topology.sources_finished().await;
-    }
-
-    async fn stop(self) {
-        self.topology.stop().await;
-    }
-}
-
-pub fn init_global() {
-    openssl_probe::init_ssl_cert_env_vars();
-
-    #[cfg(not(feature = "enterprise-tests"))]
-    metrics::init_global().expect("metrics initialization failed");
 }
 
 fn get_log_levels(default: &str) -> String {
     std::env::var("VECTOR_LOG")
         .or_else(|_| {
-            std::env::var("LOG").map(|log| {
+            std::env::var("LOG").inspect(|_log| {
                 warn!(
                     message =
                         "DEPRECATED: Use of $LOG is deprecated. Please use $VECTOR_LOG instead."
                 );
-                log
             })
         })
-        .unwrap_or_else(|_| match default {
-            "off" => "off".to_owned(),
-            level => [
-                format!("vector={}", level),
-                format!("codec={}", level),
-                format!("vrl={}", level),
-                format!("file_source={}", level),
-                "tower_limit=trace".to_owned(),
-                format!("rdkafka={}", level),
-                format!("buffers={}", level),
-                format!("lapin={}", level),
-                format!("kube={}", level),
-            ]
-            .join(","),
-        })
+        .unwrap_or_else(|_| default.into())
 }
 
 pub fn build_runtime(threads: Option<usize>, thread_name: &str) -> Result<Runtime, ExitCode> {
     let mut rt_builder = runtime::Builder::new_multi_thread();
+    rt_builder.max_blocking_threads(20_000);
     rt_builder.enable_all().thread_name(thread_name);
 
-    if let Some(threads) = threads {
-        if threads < 1 {
-            #[allow(clippy::print_stderr)]
-            {
-                eprintln!("The `threads` argument must be greater or equal to 1.");
-            }
-            return Err(exitcode::CONFIG);
-        } else {
-            WORKER_THREADS
-                .set(NonZeroUsize::new(threads).expect("already checked"))
-                .expect("double thread initialization");
-            rt_builder.worker_threads(threads);
-        }
+    let threads = threads.unwrap_or_else(crate::num_threads);
+    if threads == 0 {
+        error!("The `threads` argument must be greater or equal to 1.");
+        return Err(exitcode::CONFIG);
     }
+    WORKER_THREADS
+        .compare_exchange(0, threads, Ordering::Acquire, Ordering::Relaxed)
+        .unwrap_or_else(|_| panic!("double thread initialization"));
+    rt_builder.worker_threads(threads);
 
+    debug!(messaged = "Building runtime.", worker_threads = threads);
     Ok(rt_builder.build().expect("Unable to create async runtime"))
 }
 
 pub async fn load_configs(
     config_paths: &[ConfigPath],
-    watch_config: bool,
+    watcher_conf: Option<config::watcher::WatcherConfig>,
     require_healthy: Option<bool>,
+    allow_empty_config: bool,
+    graceful_shutdown_duration: Option<Duration>,
     signal_handler: &mut SignalHandler,
 ) -> Result<Config, ExitCode> {
     let config_paths = config::process_paths(config_paths).ok_or(exitcode::CONFIG)?;
 
-    if watch_config {
+    if let Some(watcher_conf) = watcher_conf {
         // Start listening for config changes immediately.
-        config::watcher::spawn_thread(config_paths.iter().map(Into::into), None).map_err(
-            |error| {
-                error!(message = "Unable to start config watcher.", %error);
-                exitcode::CONFIG
-            },
-        )?;
+        config::watcher::spawn_thread(
+            watcher_conf,
+            signal_handler.clone_tx(),
+            config_paths.iter().map(Into::into),
+            None,
+        )
+        .map_err(|error| {
+            error!(message = "Unable to start config watcher.", %error);
+            exitcode::CONFIG
+        })?;
     }
 
     info!(
@@ -497,43 +510,24 @@ pub async fn load_configs(
         paths = ?config_paths.iter().map(<&PathBuf>::from).collect::<Vec<_>>()
     );
 
-    #[cfg(not(feature = "enterprise-tests"))]
-    config::init_log_schema(&config_paths, true).map_err(handle_config_errors)?;
+    let mut config = config::load_from_paths_with_provider_and_secrets(
+        &config_paths,
+        signal_handler,
+        allow_empty_config,
+    )
+    .await
+    .map_err(handle_config_errors)?;
 
-    let mut config =
-        config::load_from_paths_with_provider_and_secrets(&config_paths, signal_handler)
-            .await
-            .map_err(handle_config_errors)?;
+    config::init_log_schema(config.global.log_schema.clone(), true);
+    config::init_telemetry(config.global.telemetry.clone(), true);
 
     if !config.healthchecks.enabled {
         info!("Health checks are disabled.");
     }
     config.healthchecks.set_require_healthy(require_healthy);
+    config.graceful_shutdown_duration = graceful_shutdown_duration;
 
     Ok(config)
-}
-
-#[cfg(feature = "enterprise")]
-// Enable enterprise features, if applicable.
-fn build_enterprise(
-    config: &mut Config,
-    config_paths: Vec<ConfigPath>,
-) -> Result<Option<EnterpriseReporter<BoxFuture<'static, ()>>>, ExitCode> {
-    match EnterpriseMetadata::try_from(&*config) {
-        Ok(metadata) => {
-            let enterprise = EnterpriseReporter::new();
-
-            attach_enterprise_components(config, &metadata);
-            enterprise.send(report_configuration(config_paths, metadata));
-
-            Ok(Some(enterprise))
-        }
-        Err(EnterpriseError::MissingApiKey) => {
-            error!("Enterprise configuration incomplete: missing API key.");
-            Err(exitcode::CONFIG)
-        }
-        Err(_) => Ok(None),
-    }
 }
 
 pub fn init_logging(color: bool, format: LogFormat, log_level: &str, rate: u64) {
@@ -549,4 +543,14 @@ pub fn init_logging(color: bool, format: LogFormat, log_level: &str, rate: u64) 
         internal_log_rate_secs = rate,
     );
     info!(message = "Log level is enabled.", level = ?level);
+}
+
+pub fn watcher_config(
+    method: WatchConfigMethod,
+    interval: NonZeroU64,
+) -> config::watcher::WatcherConfig {
+    match method {
+        WatchConfigMethod::Recommended => config::watcher::WatcherConfig::RecommendedWatcher,
+        WatchConfigMethod::Poll => config::watcher::WatcherConfig::PollWatcher(interval.into()),
+    }
 }

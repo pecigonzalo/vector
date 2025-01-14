@@ -1,12 +1,13 @@
 use std::time::Duration;
+use vector_lib::ipallowlist::IpAllowlistConfig;
 
 use chrono::Utc;
-use codecs::decoding::{DeserializerConfig, FramingConfig};
-use lookup::{lookup_v2::OptionalValuePath, owned_value_path, path};
 use serde_with::serde_as;
 use smallvec::SmallVec;
-use vector_config::configurable_component;
-use vector_core::config::{LegacyKey, LogNamespace};
+use vector_lib::codecs::decoding::{DeserializerConfig, FramingConfig};
+use vector_lib::config::{LegacyKey, LogNamespace};
+use vector_lib::configurable::configurable_component;
+use vector_lib::lookup::{lookup_v2::OptionalValuePath, owned_value_path, path};
 
 use crate::{
     codecs::Decoder,
@@ -17,7 +18,7 @@ use crate::{
     tls::TlsSourceConfig,
 };
 
-use super::{default_host_key, default_max_length, SocketConfig};
+use super::{default_host_key, SocketConfig};
 
 /// TCP configuration for the `socket` source.
 #[serde_as]
@@ -30,19 +31,10 @@ pub struct TcpConfig {
     #[configurable(derived)]
     keepalive: Option<TcpKeepaliveConfig>,
 
-    /// The maximum buffer size of incoming messages.
-    ///
-    /// Messages larger than this are truncated.
-    // TODO: communicated as deprecated in v0.29.0, can be removed in v0.30.0
-    #[configurable(
-        deprecated = "This option has been deprecated. Configure `max_length` on the framing config instead."
-    )]
-    #[configurable(metadata(docs::type_unit = "bytes"))]
-    max_length: Option<usize>,
-
     /// The timeout before a connection is forcefully closed during shutdown.
     #[serde(default = "default_shutdown_timeout_secs")]
     #[serde_as(as = "serde_with::DurationSeconds<u64>")]
+    #[configurable(metadata(docs::human_name = "Shutdown Timeout"))]
     shutdown_timeout_secs: Duration,
 
     /// Overrides the name of the log field used to add the peer host to each event.
@@ -54,8 +46,7 @@ pub struct TcpConfig {
     /// Set to `""` to suppress this key.
     ///
     /// [global_host_key]: https://vector.dev/docs/reference/configuration/global-options/#log_schema.host_key
-    #[serde(default = "default_host_key")]
-    host_key: OptionalValuePath,
+    host_key: Option<OptionalValuePath>,
 
     /// Overrides the name of the log field used to add the peer host's port to each event.
     ///
@@ -66,6 +57,9 @@ pub struct TcpConfig {
     /// Set to `""` to suppress this key.
     #[serde(default = "default_port_key")]
     port_key: OptionalValuePath,
+
+    #[configurable(derived)]
+    pub permit_origin: Option<IpAllowlistConfig>,
 
     #[configurable(derived)]
     tls: Option<TlsSourceConfig>,
@@ -85,11 +79,11 @@ pub struct TcpConfig {
     pub connection_limit: Option<u32>,
 
     #[configurable(derived)]
-    framing: Option<FramingConfig>,
+    pub(super) framing: Option<FramingConfig>,
 
     #[configurable(derived)]
     #[serde(default = "default_decoding")]
-    decoding: DeserializerConfig,
+    pub(super) decoding: DeserializerConfig,
 
     /// The namespace to use for logs. This overrides the global setting.
     #[serde(default)]
@@ -110,10 +104,10 @@ impl TcpConfig {
         Self {
             address,
             keepalive: None,
-            max_length: default_max_length(),
             shutdown_timeout_secs: default_shutdown_timeout_secs(),
-            host_key: default_host_key(),
+            host_key: None,
             port_key: default_port_key(),
+            permit_origin: None,
             tls: None,
             receive_buffer_bytes: None,
             max_connection_duration_secs: None,
@@ -124,8 +118,8 @@ impl TcpConfig {
         }
     }
 
-    pub const fn host_key(&self) -> &OptionalValuePath {
-        &self.host_key
+    pub(super) fn host_key(&self) -> OptionalValuePath {
+        self.host_key.clone().unwrap_or(default_host_key())
     }
 
     pub const fn port_key(&self) -> &OptionalValuePath {
@@ -152,10 +146,6 @@ impl TcpConfig {
         self.keepalive
     }
 
-    pub const fn max_length(&self) -> Option<usize> {
-        self.max_length
-    }
-
     pub const fn shutdown_timeout_secs(&self) -> Duration {
         self.shutdown_timeout_secs
     }
@@ -170,11 +160,6 @@ impl TcpConfig {
 
     pub fn set_max_connection_duration_secs(&mut self, val: Option<u64>) -> &mut Self {
         self.max_connection_duration_secs = val;
-        self
-    }
-
-    pub fn set_max_length(&mut self, val: Option<usize>) -> &mut Self {
-        self.max_length = val;
         self
     }
 
@@ -222,7 +207,7 @@ impl RawTcpSource {
 }
 
 impl TcpSource for RawTcpSource {
-    type Error = codecs::decoding::Error;
+    type Error = vector_lib::codecs::decoding::Error;
     type Item = SmallVec<[Event; 1]>;
     type Decoder = Decoder;
     type Acker = TcpNullAcker;
@@ -242,7 +227,12 @@ impl TcpSource for RawTcpSource {
                     now,
                 );
 
-                let legacy_host_key = self.config.host_key.clone().path;
+                let legacy_host_key = self
+                    .config
+                    .host_key
+                    .clone()
+                    .unwrap_or(default_host_key())
+                    .path;
 
                 self.log_namespace.insert_source_metadata(
                     SocketConfig::NAME,

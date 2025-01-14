@@ -9,12 +9,14 @@ documentation in tandem with code changes.
 
 1. [Responsibilities](#responsibilities)
 2. [Reference documentation](#reference-documentation)
-   1. [Formatting](#formatting)
-   2. [Validating](#validating)
+   1. [Installing CUE](#installing-cue)
+   2. [Generating from source code](#generating-from-source-code)
+   3. [Formatting](#formatting)
+   4. [Validating](#validating)
       1. [Tips & tricks](#tips--tricks)
          1. [Make small incremental changes](#make-small-incremental-changes)
-   3. [Changelog](#changelog)
-   4. [Release highlights](#release-highlights)
+   5. [Changelog](#changelog)
+   6. [Release highlights](#release-highlights)
       1. [FAQ](#faq)
          1. [What makes a release highlight noteworthy?](#what-makes-a-release-highlight-noteworthy)
          2. [How is a release highlight different from a blog post?](#how-is-a-release-highlight-different-from-a-blog-post)
@@ -49,9 +51,18 @@ suitable for complex data definitions.
 
 Cue can be [installed](https://cuelang.org/docs/install/) from package managers,
 however it may be necessary to install it from source in order to use the correct
-version that Vector depends on. Currently Vector is using `v0.4.2`. Using a CUE
+version that Vector depends on. Currently Vector is using `v0.7.0`. Using a CUE
 version different than this may result in CUE check/build errors. We are aiming
 to improve the developer experience around external tool dependencies ([#15909](https://github.com/vectordotdev/vector/issues/15909)).
+
+### Generating from source code
+
+Much of Vector's reference documentation is automatically compiled from source code (e.g., doc comments).
+To regenerate this content, run:
+
+```bash
+make generate-component-docs
+```
 
 ### Formatting
 
@@ -61,7 +72,7 @@ properly formatted. To run CUE's autoformatting, first [install cue](https://cue
 then run this command from the `vector` root:
 
 ```bash
-cue fmt ./website/**/*.cue
+./website/scripts/cue.sh fmt
 ```
 
 If that rewrites any files, make sure to commit your changes or else you'll see
@@ -74,8 +85,12 @@ the provided data needs to conform to various CUE schemas. To check the validity
 of the CUE sources:
 
 ```bash
-make check-docs
+cd .. # Change to the repo root directory
+CI=true make check-docs
 ```
+
+> When the CI flag is on, then the checker will also run a CUE format validation step.
+> Also, note that when this flag on, CUE files might be modified. See `scripts/check-docs.sh` for details.
 
 #### Tips & tricks
 

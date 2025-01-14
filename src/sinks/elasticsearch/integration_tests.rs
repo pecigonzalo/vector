@@ -1,14 +1,14 @@
 use std::{fs::File, io::Read};
 
-use aws_smithy_http::body::SdkBody;
+use aws_smithy_types::body::SdkBody;
 use bytes::Bytes;
 use chrono::Utc;
 use futures::StreamExt;
 use futures::{future::ready, stream};
 use http::{Request, StatusCode};
 use serde_json::{json, Value};
-use vector_core::{
-    config::log_schema,
+use vector_lib::{
+    config::{init_telemetry, log_schema, Tags, Telemetry},
     event::{BatchNotifier, BatchStatus, Event, LogEvent},
 };
 
@@ -18,13 +18,13 @@ use crate::{
     config::{ProxyConfig, SinkConfig, SinkContext},
     http::HttpClient,
     sinks::{
-        util::{BatchConfig, Compression, SinkBatchSettings},
+        util::{auth::Auth, BatchConfig, Compression, SinkBatchSettings},
         HealthcheckError,
     },
     test_util::{
         components::{
-            run_and_assert_sink_compliance, run_and_assert_sink_error, COMPONENT_ERROR_TAGS,
-            HTTP_SINK_TAGS,
+            run_and_assert_data_volume_sink_compliance, run_and_assert_sink_compliance,
+            run_and_assert_sink_error, COMPONENT_ERROR_TAGS, DATA_VOLUME_SINK_TAGS, HTTP_SINK_TAGS,
         },
         random_events_with_stream, random_string, trace_init,
     },
@@ -58,14 +58,24 @@ impl ElasticsearchCommon {
             builder = builder.header(&header[..], &value[..]);
         }
 
-        if let Some(auth) = &self.http_auth {
-            builder = auth.apply_builder(builder);
-        }
-
         let mut request = builder.body(Bytes::new())?;
-
-        if let Some(credentials_provider) = &self.aws_auth {
-            sign_request(&mut request, credentials_provider, &self.region).await?;
+        if let Some(auth) = &self.auth {
+            match auth {
+                Auth::Basic(http_auth) => http_auth.apply(&mut request),
+                #[cfg(feature = "aws-core")]
+                Auth::Aws {
+                    credentials_provider: provider,
+                    region,
+                } => {
+                    sign_request(
+                        &OpenSearchServiceType::Managed,
+                        &mut request,
+                        provider,
+                        Some(region),
+                    )
+                    .await?
+                }
+            }
         }
 
         let proxy = ProxyConfig::default();
@@ -127,6 +137,28 @@ async fn ensure_pipeline_in_params() {
 }
 
 #[tokio::test]
+async fn ensure_empty_pipeline_not_in_params() {
+    let index = gen_index();
+    let pipeline = String::from("");
+
+    let config = ElasticsearchConfig {
+        endpoints: vec![http_server()],
+        bulk: BulkConfig {
+            index,
+            ..Default::default()
+        },
+        pipeline: Some(pipeline.clone()),
+        batch: batch_settings(),
+        ..Default::default()
+    };
+    let common = ElasticsearchCommon::parse_single(&config)
+        .await
+        .expect("Config error");
+
+    assert_eq!(common.query_params.get("pipeline"), None);
+}
+
+#[tokio::test]
 async fn structures_events_correctly() {
     let index = gen_index();
     let config = ElasticsearchConfig {
@@ -146,7 +178,7 @@ async fn structures_events_correctly() {
         .expect("Config error");
     let base_url = common.base_url.clone();
 
-    let cx = SinkContext::new_test();
+    let cx = SinkContext::default();
     let (sink, _hc) = config.build(cx.clone()).await.unwrap();
 
     let (batch, mut receiver) = BatchNotifier::new_with_receiver();
@@ -175,7 +207,7 @@ async fn structures_events_correctly() {
     flush(common).await.unwrap();
 
     let response = reqwest::Client::new()
-        .get(&format!("{}/{}/_search", base_url, index))
+        .get(format!("{}/{}/_search", base_url, index))
         .json(&json!({
             "query": { "query_string": { "query": "*" } }
         }))
@@ -224,17 +256,18 @@ async fn auto_version_http() {
         batch: batch_settings(),
         ..Default::default()
     };
-    let _ = ElasticsearchCommon::parse_single(&config)
+    _ = ElasticsearchCommon::parse_single(&config)
         .await
         .expect("Config error");
 }
 
+#[cfg(feature = "aws-core")]
 #[tokio::test]
 async fn auto_version_https() {
     trace_init();
 
     let config = ElasticsearchConfig {
-        auth: Some(ElasticsearchAuth::Basic {
+        auth: Some(ElasticsearchAuthConfig::Basic {
             user: "elastic".to_string(),
             password: "vector".to_string().into(),
         }),
@@ -249,28 +282,32 @@ async fn auto_version_https() {
         batch: batch_settings(),
         ..Default::default()
     };
-    let _ = ElasticsearchCommon::parse_single(&config)
+    _ = ElasticsearchCommon::parse_single(&config)
         .await
         .expect("Config error");
 }
 
+#[cfg(feature = "aws-core")]
 #[tokio::test]
 async fn auto_version_aws() {
     trace_init();
 
     let config = ElasticsearchConfig {
-        auth: Some(ElasticsearchAuth::Aws(AwsAuthentication::Default {
-            load_timeout_secs: Some(5),
-            imds: ImdsAuthentication::default(),
-        })),
+        auth: Some(ElasticsearchAuthConfig::Aws(
+            crate::aws::AwsAuthentication::Default {
+                load_timeout_secs: Some(5),
+                imds: ImdsAuthentication::default(),
+                region: None,
+            },
+        )),
         endpoints: vec![aws_server()],
-        aws: Some(RegionOrEndpoint::with_region(String::from("localstack"))),
+        aws: Some(RegionOrEndpoint::with_region(String::from("us-east-1"))),
         api_version: ElasticsearchApiVersion::Auto,
         batch: batch_settings(),
         ..Default::default()
     };
 
-    let _ = ElasticsearchCommon::parse_single(&config)
+    _ = ElasticsearchCommon::parse_single(&config)
         .await
         .expect("Config error");
 }
@@ -287,7 +324,25 @@ async fn insert_events_over_http() {
             batch: batch_settings(),
             ..Default::default()
         },
-        false,
+        TestType::Normal,
+        BatchStatus::Delivered,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn insert_events_with_data_volume() {
+    trace_init();
+
+    run_insert_tests(
+        ElasticsearchConfig {
+            endpoints: vec![http_server()],
+            doc_type: "log_lines".into(),
+            compression: Compression::None,
+            batch: batch_settings(),
+            ..Default::default()
+        },
+        TestType::DataVolume,
         BatchStatus::Delivered,
     )
     .await;
@@ -305,7 +360,7 @@ async fn insert_events_over_http_with_gzip_compression() {
             batch: batch_settings(),
             ..Default::default()
         },
-        false,
+        TestType::Normal,
         BatchStatus::Delivered,
     )
     .await;
@@ -317,7 +372,7 @@ async fn insert_events_over_https() {
 
     run_insert_tests(
         ElasticsearchConfig {
-            auth: Some(ElasticsearchAuth::Basic {
+            auth: Some(ElasticsearchAuthConfig::Basic {
                 user: "elastic".to_string(),
                 password: "vector".to_string().into(),
             }),
@@ -331,52 +386,60 @@ async fn insert_events_over_https() {
             batch: batch_settings(),
             ..Default::default()
         },
-        false,
+        TestType::Normal,
         BatchStatus::Delivered,
     )
     .await;
 }
 
+#[cfg(feature = "aws-core")]
 #[tokio::test]
 async fn insert_events_on_aws() {
     trace_init();
 
     run_insert_tests(
         ElasticsearchConfig {
-            auth: Some(ElasticsearchAuth::Aws(AwsAuthentication::Default {
-                load_timeout_secs: Some(5),
-                imds: ImdsAuthentication::default(),
-            })),
+            auth: Some(ElasticsearchAuthConfig::Aws(
+                crate::aws::AwsAuthentication::Default {
+                    load_timeout_secs: Some(5),
+                    imds: ImdsAuthentication::default(),
+                    region: None,
+                },
+            )),
             endpoints: vec![aws_server()],
-            aws: Some(RegionOrEndpoint::with_region(String::from("localstack"))),
+            aws: Some(RegionOrEndpoint::with_region(String::from("us-east-1"))),
             api_version: ElasticsearchApiVersion::V6,
             batch: batch_settings(),
             ..Default::default()
         },
-        false,
+        TestType::Normal,
         BatchStatus::Delivered,
     )
     .await;
 }
 
+#[cfg(feature = "aws-core")]
 #[tokio::test]
 async fn insert_events_on_aws_with_compression() {
     trace_init();
 
     run_insert_tests(
         ElasticsearchConfig {
-            auth: Some(ElasticsearchAuth::Aws(AwsAuthentication::Default {
-                load_timeout_secs: Some(5),
-                imds: ImdsAuthentication::default(),
-            })),
+            auth: Some(ElasticsearchAuthConfig::Aws(
+                crate::aws::AwsAuthentication::Default {
+                    load_timeout_secs: Some(5),
+                    imds: ImdsAuthentication::default(),
+                    region: None,
+                },
+            )),
             endpoints: vec![aws_server()],
-            aws: Some(RegionOrEndpoint::with_region(String::from("localstack"))),
+            aws: Some(RegionOrEndpoint::with_region(String::from("us-east-1"))),
             compression: Compression::gzip_default(),
             api_version: ElasticsearchApiVersion::V6,
             batch: batch_settings(),
             ..Default::default()
         },
-        false,
+        TestType::Normal,
         BatchStatus::Delivered,
     )
     .await;
@@ -394,7 +457,7 @@ async fn insert_events_with_failure() {
             batch: batch_settings(),
             ..Default::default()
         },
-        true,
+        TestType::Error,
         BatchStatus::Rejected,
     )
     .await;
@@ -412,7 +475,7 @@ async fn insert_events_with_failure_and_gzip_compression() {
             batch: batch_settings(),
             ..Default::default()
         },
-        true,
+        TestType::Error,
         BatchStatus::Rejected,
     )
     .await;
@@ -446,7 +509,7 @@ async fn insert_events_in_data_stream() {
         .await
         .expect("Data stream creation error");
 
-    run_insert_tests_with_config(&cfg, false, BatchStatus::Delivered).await;
+    run_insert_tests_with_config(&cfg, TestType::Normal, BatchStatus::Delivered).await;
 }
 
 #[tokio::test]
@@ -455,7 +518,7 @@ async fn distributed_insert_events() {
 
     // Assumes that behind https_server and http_server addresses lies the same server
     let mut config = ElasticsearchConfig {
-        auth: Some(ElasticsearchAuth::Basic {
+        auth: Some(ElasticsearchAuthConfig::Basic {
             user: "elastic".into(),
             password: "vector".to_string().into(),
         }),
@@ -481,7 +544,7 @@ async fn distributed_insert_events_failover() {
     trace_init();
 
     let mut config = ElasticsearchConfig {
-        auth: Some(ElasticsearchAuth::Basic {
+        auth: Some(ElasticsearchAuthConfig::Basic {
             user: "elastic".into(),
             password: "vector".to_string().into(),
         }),
@@ -509,14 +572,26 @@ async fn distributed_insert_events_failover() {
 
 async fn run_insert_tests(
     mut config: ElasticsearchConfig,
-    break_events: bool,
+    test_type: TestType,
     status: BatchStatus,
 ) {
+    if test_type == TestType::DataVolume {
+        init_telemetry(
+            Telemetry {
+                tags: Tags {
+                    emit_service: true,
+                    emit_source: true,
+                },
+            },
+            true,
+        );
+    }
+
     config.bulk = BulkConfig {
         index: gen_index(),
         ..Default::default()
     };
-    run_insert_tests_with_config(&config, break_events, status).await;
+    run_insert_tests_with_config(&config, test_type, status).await;
 }
 
 fn create_http_client() -> reqwest::Client {
@@ -534,9 +609,16 @@ fn create_http_client() -> reqwest::Client {
         .expect("Could not build HTTP client")
 }
 
+#[derive(Eq, PartialEq)]
+enum TestType {
+    Error,
+    DataVolume,
+    Normal,
+}
+
 async fn run_insert_tests_with_config(
     config: &ElasticsearchConfig,
-    break_events: bool,
+    test_type: TestType,
     batch_status: BatchStatus,
 ) {
     let common = ElasticsearchCommon::parse_single(config)
@@ -552,7 +634,7 @@ async fn run_insert_tests_with_config(
     };
     let base_url = common.base_url.clone();
 
-    let cx = SinkContext::new_test();
+    let cx = SinkContext::default();
     let (sink, healthcheck) = config
         .build(cx.clone())
         .await
@@ -562,22 +644,30 @@ async fn run_insert_tests_with_config(
 
     let (batch, mut receiver) = BatchNotifier::new_with_receiver();
     let (input, events) = random_events_with_stream(100, 100, Some(batch));
-    if break_events {
-        // Break all but the first event to simulate some kind of partial failure
-        let mut doit = false;
-        let events = events.map(move |mut events| {
-            if doit {
-                events.iter_logs_mut().for_each(|log| {
-                    log.insert("_type", 1);
-                });
-            }
-            doit = true;
-            events
-        });
+    match test_type {
+        TestType::Error => {
+            // Break all but the first event to simulate some kind of partial failure
+            let mut doit = false;
+            let events = events.map(move |mut events| {
+                if doit {
+                    events.iter_logs_mut().for_each(|log| {
+                        log.insert("_type", 1);
+                    });
+                }
+                doit = true;
+                events
+            });
 
-        run_and_assert_sink_error(sink, events, &COMPONENT_ERROR_TAGS).await;
-    } else {
-        run_and_assert_sink_compliance(sink, events, &HTTP_SINK_TAGS).await;
+            run_and_assert_sink_error(sink, events, &COMPONENT_ERROR_TAGS).await;
+        }
+
+        TestType::DataVolume => {
+            run_and_assert_data_volume_sink_compliance(sink, events, &DATA_VOLUME_SINK_TAGS).await;
+        }
+
+        TestType::Normal => {
+            run_and_assert_sink_compliance(sink, events, &HTTP_SINK_TAGS).await;
+        }
     }
 
     assert_eq!(receiver.try_recv(), Ok(batch_status));
@@ -587,7 +677,7 @@ async fn run_insert_tests_with_config(
 
     let client = create_http_client();
     let mut response = client
-        .get(&format!("{}/{}/_search", base_url, index))
+        .get(format!("{}/{}/_search", base_url, index))
         .basic_auth("elastic", Some("vector"))
         .json(&json!({
             "query": { "query_string": { "query": "*" } }
@@ -604,7 +694,7 @@ async fn run_insert_tests_with_config(
         .or_else(|| response["hits"]["total"].as_u64())
         .expect("Elasticsearch response does not include hits->total nor hits->total->value");
 
-    if break_events {
+    if test_type == TestType::Error {
         assert_ne!(input.len() as u64, total);
     } else {
         assert_eq!(input.len() as u64, total);
@@ -616,7 +706,7 @@ async fn run_insert_tests_with_config(
         // https://github.com/rust-lang/rust-clippy/issues/6909
         let input = input
             .into_iter()
-            .map(|rec| serde_json::to_value(&rec.into_log()).unwrap())
+            .map(|rec| serde_json::to_value(rec.into_log()).unwrap())
             .collect::<Vec<_>>();
 
         for hit in hits {
@@ -636,7 +726,7 @@ async fn run_insert_tests_with_config(
 }
 
 async fn run_insert_tests_with_multiple_endpoints(config: &ElasticsearchConfig) {
-    let cx = SinkContext::new_test();
+    let cx = SinkContext::default();
     let commons = ElasticsearchCommon::parse_many(config, cx.proxy())
         .await
         .expect("Config error");
@@ -669,14 +759,14 @@ async fn run_insert_tests_with_multiple_endpoints(config: &ElasticsearchConfig) 
 
     // make sure writes are all visible
     for common in commons {
-        let _ = flush(common).await;
+        _ = flush(common).await;
     }
 
     let client = create_http_client();
     let mut total = 0;
     for base_url in base_urls {
         if let Ok(response) = client
-            .get(&format!("{}/{}/_search", base_url, index))
+            .get(format!("{}/{}/_search", base_url, index))
             .basic_auth("elastic", Some("vector"))
             .json(&json!({
                 "query": { "query_string": { "query": "*" } }

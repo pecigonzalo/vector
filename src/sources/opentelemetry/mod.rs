@@ -11,20 +11,25 @@ mod status;
 use std::net::SocketAddr;
 
 use futures::{future::join, FutureExt, TryFutureExt};
-use lookup::{owned_value_path, OwnedTargetPath};
-use opentelemetry_proto::convert::{
+use tonic::codec::CompressionEncoding;
+use vector_lib::lookup::{owned_value_path, OwnedTargetPath};
+use vector_lib::opentelemetry::convert::{
     ATTRIBUTES_KEY, DROPPED_ATTRIBUTES_COUNT_KEY, FLAGS_KEY, OBSERVED_TIMESTAMP_KEY, RESOURCE_KEY,
     SEVERITY_NUMBER_KEY, SEVERITY_TEXT_KEY, SPAN_ID_KEY, TRACE_ID_KEY,
 };
 
-use opentelemetry_proto::proto::collector::logs::v1::logs_service_server::LogsServiceServer;
-use value::{kind::Collection, Kind};
-use vector_common::internal_event::{BytesReceived, EventsReceived, Protocol};
-use vector_config::configurable_component;
-use vector_core::{
+use tonic::transport::server::RoutesBuilder;
+use vector_lib::configurable::configurable_component;
+use vector_lib::internal_event::{BytesReceived, EventsReceived, Protocol};
+use vector_lib::opentelemetry::proto::collector::{
+    logs::v1::logs_service_server::LogsServiceServer,
+    trace::v1::trace_service_server::TraceServiceServer,
+};
+use vector_lib::{
     config::{log_schema, LegacyKey, LogNamespace},
     schema::Definition,
 };
+use vrl::value::{kind::Collection, Kind};
 
 use self::{
     grpc::Service,
@@ -32,18 +37,22 @@ use self::{
 };
 use crate::{
     config::{
-        DataType, GenerateConfig, Output, Resource, SourceAcknowledgementsConfig, SourceConfig,
-        SourceContext,
+        DataType, GenerateConfig, Resource, SourceAcknowledgementsConfig, SourceConfig,
+        SourceContext, SourceOutput,
     },
+    http::KeepaliveConfig,
     serde::bool_or_struct,
-    sources::{util::grpc::run_grpc_server, Source},
+    sources::{util::grpc::run_grpc_server_with_routes, Source},
     tls::{MaybeTlsSettings, TlsEnableableConfig},
 };
 
+use super::http_server::{build_param_matcher, remove_duplicates};
+
 pub const LOGS: &str = "logs";
+pub const TRACES: &str = "traces";
 
 /// Configuration for the `opentelemetry` source.
-#[configurable_component(source("opentelemetry"))]
+#[configurable_component(source("opentelemetry", "Receive OTLP data through gRPC or HTTP."))]
 #[derive(Clone, Debug)]
 #[serde(deny_unknown_fields)]
 pub struct OpentelemetryConfig {
@@ -102,12 +111,32 @@ struct HttpConfig {
     #[configurable(derived)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     tls: Option<TlsEnableableConfig>,
+
+    #[configurable(derived)]
+    #[serde(default)]
+    keepalive: KeepaliveConfig,
+
+    /// A list of HTTP headers to include in the log event.
+    ///
+    /// Accepts the wildcard (`*`) character for headers matching a specified pattern.
+    ///
+    /// Specifying "*" results in all headers included in the log event.
+    ///
+    /// These headers are not included in the JSON payload if a field with a conflicting name exists.
+    #[serde(default)]
+    #[configurable(metadata(docs::examples = "User-Agent"))]
+    #[configurable(metadata(docs::examples = "X-My-Custom-Header"))]
+    #[configurable(metadata(docs::examples = "X-*"))]
+    #[configurable(metadata(docs::examples = "*"))]
+    headers: Vec<String>,
 }
 
 fn example_http_config() -> HttpConfig {
     HttpConfig {
         address: "0.0.0.0:4318".parse().unwrap(),
         tls: None,
+        keepalive: KeepaliveConfig::default(),
+        headers: vec![],
     }
 }
 
@@ -124,49 +153,72 @@ impl GenerateConfig for OpentelemetryConfig {
 }
 
 #[async_trait::async_trait]
+#[typetag::serde(name = "opentelemetry")]
 impl SourceConfig for OpentelemetryConfig {
     async fn build(&self, cx: SourceContext) -> crate::Result<Source> {
         let acknowledgements = cx.do_acknowledgements(self.acknowledgements);
         let events_received = register!(EventsReceived);
         let log_namespace = cx.log_namespace(self.log_namespace);
 
-        let grpc_tls_settings = MaybeTlsSettings::from_config(&self.grpc.tls, true)?;
-        let grpc_service = LogsServiceServer::new(Service {
+        let grpc_tls_settings = MaybeTlsSettings::from_config(self.grpc.tls.as_ref(), true)?;
+
+        let log_service = LogsServiceServer::new(Service {
             pipeline: cx.out.clone(),
             acknowledgements,
             log_namespace,
             events_received: events_received.clone(),
         })
-        .accept_compressed(tonic::codec::CompressionEncoding::Gzip);
-        let grpc_source = run_grpc_server(
+        .accept_compressed(CompressionEncoding::Gzip)
+        .max_decoding_message_size(usize::MAX);
+
+        let trace_service = TraceServiceServer::new(Service {
+            pipeline: cx.out.clone(),
+            acknowledgements,
+            log_namespace,
+            events_received: events_received.clone(),
+        })
+        .accept_compressed(CompressionEncoding::Gzip)
+        .max_decoding_message_size(usize::MAX);
+
+        let mut builder = RoutesBuilder::default();
+        builder.add_service(log_service).add_service(trace_service);
+        let grpc_source = run_grpc_server_with_routes(
             self.grpc.address,
             grpc_tls_settings,
-            grpc_service,
+            builder.routes(),
             cx.shutdown.clone(),
         )
         .map_err(|error| {
             error!(message = "Source future failed.", %error);
         });
 
-        let http_tls_settings = MaybeTlsSettings::from_config(&self.http.tls, true)?;
+        let http_tls_settings = MaybeTlsSettings::from_config(self.http.tls.as_ref(), true)?;
         let protocol = http_tls_settings.http_protocol_name();
         let bytes_received = register!(BytesReceived::from(Protocol::from(protocol)));
+        let headers =
+            build_param_matcher(&remove_duplicates(self.http.headers.clone(), "headers"))?;
         let filters = build_warp_filter(
             acknowledgements,
             log_namespace,
             cx.out,
             bytes_received,
             events_received,
+            headers,
         );
-        let http_source =
-            run_http_server(self.http.address, http_tls_settings, filters, cx.shutdown);
+        let http_source = run_http_server(
+            self.http.address,
+            http_tls_settings,
+            filters,
+            cx.shutdown,
+            self.http.keepalive.clone(),
+        );
 
         Ok(join(grpc_source, http_source).map(|_| Ok(())).boxed())
     }
 
     // TODO: appropriately handle "severity" meaning across both "severity_text" and "severity_number",
     // as both are optional and can be converted to/from.
-    fn outputs(&self, global_log_namespace: LogNamespace) -> Vec<Output> {
+    fn outputs(&self, global_log_namespace: LogNamespace) -> Vec<SourceOutput> {
         let log_namespace = global_log_namespace.merge(self.log_namespace);
         let schema_definition = Definition::new_with_default_metadata(Kind::any(), [log_namespace])
             .with_source_metadata(
@@ -254,9 +306,10 @@ impl SourceConfig for OpentelemetryConfig {
             }
         };
 
-        vec![Output::default(DataType::Log)
-            .with_port(LOGS)
-            .with_schema_definition(schema_definition)]
+        vec![
+            SourceOutput::new_maybe_logs(DataType::Log, schema_definition).with_port(LOGS),
+            SourceOutput::new_traces().with_port(TRACES),
+        ]
     }
 
     fn resources(&self) -> Vec<Resource> {

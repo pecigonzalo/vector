@@ -1,18 +1,18 @@
 use chrono::Utc;
-use codecs::BytesDeserializerConfig;
 use futures::{stream, StreamExt};
-use lookup::lookup_v2::OptionalValuePath;
-use lookup::{owned_value_path, path, OwnedValuePath};
-use value::Kind;
-use vector_config::configurable_component;
-use vector_core::config::log_schema;
-use vector_core::{
+use vector_lib::codecs::BytesDeserializerConfig;
+use vector_lib::config::log_schema;
+use vector_lib::configurable::configurable_component;
+use vector_lib::lookup::lookup_v2::OptionalValuePath;
+use vector_lib::lookup::{owned_value_path, path, OwnedValuePath};
+use vector_lib::{
     config::{LegacyKey, LogNamespace},
     schema::Definition,
 };
+use vrl::value::Kind;
 
 use crate::{
-    config::{DataType, Output, SourceConfig, SourceContext},
+    config::{DataType, SourceConfig, SourceContext, SourceOutput},
     event::{EstimatedJsonEncodedSizeOf, Event},
     internal_events::{InternalLogsBytesReceived, InternalLogsEventsReceived, StreamClosedError},
     shutdown::ShutdownSignal,
@@ -21,7 +21,10 @@ use crate::{
 };
 
 /// Configuration for the `internal_logs` source.
-#[configurable_component(source("internal_logs"))]
+#[configurable_component(source(
+    "internal_logs",
+    "Expose internal log messages emitted by the running Vector instance."
+))]
 #[derive(Clone, Debug)]
 #[serde(deny_unknown_fields)]
 pub struct InternalLogsConfig {
@@ -32,8 +35,7 @@ pub struct InternalLogsConfig {
     /// Set to `""` to suppress this key.
     ///
     /// [global_host_key]: https://vector.dev/docs/reference/configuration/global-options/#log_schema.host_key
-    #[serde(default = "default_host_key")]
-    host_key: OptionalValuePath,
+    host_key: Option<OptionalValuePath>,
 
     /// Overrides the name of the log field used to add the current process ID to each event.
     ///
@@ -49,10 +51,6 @@ pub struct InternalLogsConfig {
     log_namespace: Option<bool>,
 }
 
-fn default_host_key() -> OptionalValuePath {
-    OptionalValuePath::from(owned_value_path!(log_schema().host_key()))
-}
-
 fn default_pid_key() -> OptionalValuePath {
     OptionalValuePath::from(owned_value_path!("pid"))
 }
@@ -62,7 +60,7 @@ impl_generate_config_from_default!(InternalLogsConfig);
 impl Default for InternalLogsConfig {
     fn default() -> InternalLogsConfig {
         InternalLogsConfig {
-            host_key: default_host_key(),
+            host_key: None,
             pid_key: default_pid_key(),
             log_namespace: None,
         }
@@ -72,7 +70,12 @@ impl Default for InternalLogsConfig {
 impl InternalLogsConfig {
     /// Generates the `schema::Definition` for this component.
     fn schema_definition(&self, log_namespace: LogNamespace) -> Definition {
-        let host_key = self.host_key.clone().path.map(LegacyKey::Overwrite);
+        let host_key = self
+            .host_key
+            .clone()
+            .unwrap_or(log_schema().host_key().cloned().into())
+            .path
+            .map(LegacyKey::Overwrite);
         let pid_key = self.pid_key.clone().path.map(LegacyKey::Overwrite);
 
         // There is a global and per-source `log_namespace` config.
@@ -98,9 +101,14 @@ impl InternalLogsConfig {
 }
 
 #[async_trait::async_trait]
+#[typetag::serde(name = "internal_logs")]
 impl SourceConfig for InternalLogsConfig {
     async fn build(&self, cx: SourceContext) -> crate::Result<super::Source> {
-        let host_key = self.host_key.clone().path;
+        let host_key = self
+            .host_key
+            .clone()
+            .unwrap_or(log_schema().host_key().cloned().into())
+            .path;
         let pid_key = self.pid_key.clone().path;
 
         let subscription = TraceSubscription::subscribe();
@@ -117,11 +125,14 @@ impl SourceConfig for InternalLogsConfig {
         )))
     }
 
-    fn outputs(&self, global_log_namespace: LogNamespace) -> Vec<Output> {
+    fn outputs(&self, global_log_namespace: LogNamespace) -> Vec<SourceOutput> {
         let schema_definition =
             self.schema_definition(global_log_namespace.merge(self.log_namespace));
 
-        vec![Output::default(DataType::Log).with_schema_definition(schema_definition)]
+        vec![SourceOutput::new_maybe_logs(
+            DataType::Log,
+            schema_definition,
+        )]
     }
 
     fn can_acknowledge(&self) -> bool {
@@ -151,12 +162,14 @@ async fn run(
     // any logs that don't break the loop, as that could cause an
     // infinite loop since it receives all such logs.
     while let Some(mut log) = rx.next().await {
-        let byte_size = log.estimated_json_encoded_size_of();
+        // TODO: Should this actually be in memory size?
+        let byte_size = log.estimated_json_encoded_size_of().get();
+        let json_byte_size = log.estimated_json_encoded_size_of();
         // This event doesn't emit any log
         emit!(InternalLogsBytesReceived { byte_size });
         emit!(InternalLogsEventsReceived {
             count: 1,
-            byte_size,
+            byte_size: json_byte_size,
         });
 
         if let Ok(hostname) = &hostname {
@@ -185,9 +198,9 @@ async fn run(
             Utc::now(),
         );
 
-        if let Err(error) = out.send_event(Event::from(log)).await {
+        if (out.send_event(Event::from(log)).await).is_err() {
             // this wont trigger any infinite loop considering it stops the component
-            emit!(StreamClosedError { error, count: 1 });
+            emit!(StreamClosedError { count: 1 });
             return Err(());
         }
     }
@@ -198,10 +211,10 @@ async fn run(
 #[cfg(test)]
 mod tests {
     use futures::Stream;
-    use lookup::OwnedTargetPath;
     use tokio::time::{sleep, Duration};
-    use value::kind::Collection;
-    use vector_core::event::Value;
+    use vector_lib::event::Value;
+    use vector_lib::lookup::OwnedTargetPath;
+    use vrl::value::kind::Collection;
 
     use super::*;
     use crate::{
@@ -335,10 +348,10 @@ mod tests {
     fn output_schema_definition_vector_namespace() {
         let config = InternalLogsConfig::default();
 
-        let definition = config.outputs(LogNamespace::Vector)[0]
-            .clone()
-            .log_schema_definition
-            .unwrap();
+        let definitions = config
+            .outputs(LogNamespace::Vector)
+            .remove(0)
+            .schema_definition(true);
 
         let expected_definition =
             Definition::new_with_default_metadata(Kind::bytes(), [LogNamespace::Vector])
@@ -364,7 +377,7 @@ mod tests {
                     Some("host"),
                 );
 
-        assert_eq!(definition, expected_definition)
+        assert_eq!(definitions, Some(expected_definition))
     }
 
     #[test]
@@ -375,10 +388,10 @@ mod tests {
 
         config.pid_key = OptionalValuePath::from(owned_value_path!(pid_key));
 
-        let definition = config.outputs(LogNamespace::Legacy)[0]
-            .clone()
-            .log_schema_definition
-            .unwrap();
+        let definitions = config
+            .outputs(LogNamespace::Legacy)
+            .remove(0)
+            .schema_definition(true);
 
         let expected_definition = Definition::new_with_default_metadata(
             Kind::object(Collection::empty()),
@@ -398,6 +411,6 @@ mod tests {
             Some("host"),
         );
 
-        assert_eq!(definition, expected_definition)
+        assert_eq!(definitions, Some(expected_definition))
     }
 }

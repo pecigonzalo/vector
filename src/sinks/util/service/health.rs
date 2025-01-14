@@ -15,11 +15,10 @@ use serde_with::serde_as;
 use stream_cancel::{Trigger, Tripwire};
 use tokio::time::{sleep, Duration};
 use tower::Service;
-use vector_config::configurable_component;
+use vector_lib::{configurable::configurable_component, emit};
 
 use crate::{
-    emit,
-    internal_events::{EndpointsActive, OpenGauge, OpenToken},
+    internal_events::{EndpointsActive, OpenGauge},
     sinks::util::retries::ExponentialBackoff,
 };
 
@@ -37,11 +36,13 @@ pub struct HealthConfig {
     #[serde(default = "default_retry_initial_backoff_secs")]
     #[configurable(metadata(docs::type_unit = "seconds"))]
     // not using Duration type because the value is only used as a u64.
+    #[configurable(metadata(docs::human_name = "Retry Initial Backoff"))]
     pub retry_initial_backoff_secs: u64,
 
     /// Maximum delay between attempts to reactivate endpoints once they become unhealthy.
     #[serde_as(as = "serde_with::DurationSeconds<u64>")]
     #[serde(default = "default_retry_max_duration_secs")]
+    #[configurable(metadata(docs::human_name = "Max Retry Duration"))]
     pub retry_max_duration_secs: Duration,
 }
 
@@ -64,13 +65,14 @@ impl HealthConfig {
         let counters = Arc::new(HealthCounters::new());
         let snapshot = counters.snapshot();
 
+        open.clone().open(emit_active_endpoints);
         HealthService {
             inner,
             logic,
             counters,
             snapshot,
             endpoint,
-            state: CircuitState::Closed(open.clone().open(emit_active_endpoints)),
+            state: CircuitState::Closed,
             open,
             // An exponential backoff starting from retry_initial_backoff_sec and doubling every time
             // up to retry_max_duration_secs.
@@ -102,7 +104,7 @@ enum CircuitState {
     },
 
     /// Service is healthy and passing requests downstream.
-    Closed(OpenToken<fn(usize)>),
+    Closed,
 }
 
 /// A service which monitors the health of a service.
@@ -162,7 +164,8 @@ where
                         info!(message = "Endpoint is healthy.", endpoint = %&self.endpoint);
 
                         self.backoff.reset();
-                        CircuitState::Closed(self.open.clone().open(emit_active_endpoints))
+                        self.open.clone().open(emit_active_endpoints);
+                        CircuitState::Closed
                     } else {
                         debug!(message = "Endpoint failed probation.", endpoint = %&self.endpoint);
 
@@ -171,7 +174,7 @@ where
                         )
                     }
                 }
-                CircuitState::Closed(_) => {
+                CircuitState::Closed => {
                     // Check for errors
                     match self.counters.healthy(self.snapshot) {
                         Ok(snapshot) => {

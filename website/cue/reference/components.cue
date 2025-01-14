@@ -191,17 +191,18 @@ components: {
 		}
 
 		if Args.kind == "transform" {
-			aggregate?: #FeaturesAggregate
-			convert?:   #FeaturesConvert
-			enrich?:    #FeaturesEnrich
-			filter?:    #FeaturesFilter
-			parse?:     #FeaturesParse
-			program?:   #FeaturesProgram
-			proxy?:     #FeaturesProxy
-			reduce?:    #FeaturesReduce
-			route?:     #FeaturesRoute
-			sanitize?:  #FeaturesSanitize
-			shape?:     #FeaturesShape
+			aggregate?:       #FeaturesAggregate
+			convert?:         #FeaturesConvert
+			enrich?:          #FeaturesEnrich
+			filter?:          #FeaturesFilter
+			parse?:           #FeaturesParse
+			program?:         #FeaturesProgram
+			proxy?:           #FeaturesProxy
+			reduce?:          #FeaturesReduce
+			route?:           #FeaturesRoute
+			exclusive_route?: #FeaturesExclusiveRoute
+			sanitize?:        #FeaturesSanitize
+			shape?:           #FeaturesShape
 		}
 
 		if Args.kind == "sink" {
@@ -219,7 +220,7 @@ components: {
 			}
 
 			exposes?: #FeaturesExpose
-			send?:    #FeaturesSend & {_args: Args}
+			send?: #FeaturesSend & {_args: Args}
 		}
 
 		descriptions: [Name=string]: string
@@ -227,8 +228,7 @@ components: {
 
 	#FeaturesAcknowledgements: bool
 
-	#FeaturesAggregate: {
-	}
+	#FeaturesAggregate: {}
 
 	#FeaturesCollect: {
 		checkpoint: {
@@ -245,8 +245,7 @@ components: {
 		tls?: #FeaturesTLS & {_args: {mode: "connect"}}
 	}
 
-	#FeaturesConvert: {
-	}
+	#FeaturesConvert: {}
 
 	#FeaturesEnrich: {
 		from: service: {
@@ -265,11 +264,9 @@ components: {
 		}
 	}
 
-	#FeaturesFilter: {
-	}
+	#FeaturesFilter: {}
 
-	#FeaturesGenerate: {
-	}
+	#FeaturesGenerate: {}
 
 	#FeaturesSendBufferBytes: {
 		enabled:        bool
@@ -327,17 +324,15 @@ components: {
 		tls: #FeaturesTLS & {_args: {mode: "accept"}}
 	}
 
-	#FeaturesReduce: {
-	}
+	#FeaturesReduce: {}
 
-	#FeaturesRoute: {
-	}
+	#FeaturesRoute: {}
 
-	#FeaturesSanitize: {
-	}
+	#FeaturesExclusiveRoute: {}
 
-	#FeaturesShape: {
-	}
+	#FeaturesSanitize: {}
+
+	#FeaturesShape: {}
 
 	#FeaturesSend: {
 		_args: {
@@ -379,7 +374,7 @@ components: {
 
 					if enabled {
 						framing: bool | *false
-						enum:    [#EncodingCodec, ...#EncodingCodec] | null
+						enum: [#EncodingCodec, ...#EncodingCodec] | null
 					}
 				}
 			}
@@ -497,8 +492,8 @@ components: {
 			#RequiredFor: "operation" | "healthcheck"
 
 			// TODO: come up with a less janky URL generation scheme
-			_action:        !=""
-			required_for:   *["operation"] | [#RequiredFor, ...#RequiredFor]
+			_action: !=""
+			required_for: *["operation"] | [#RequiredFor, ...#RequiredFor]
 			docs_url:       !=""
 			required_when?: !=""
 
@@ -1207,7 +1202,7 @@ components: {
 						}
 					}
 					type:              "counter"
-					default_namespace: "vector"
+					default_namespace: string | *"vector"
 				}
 
 				_passthrough_distribution: {
@@ -1220,7 +1215,7 @@ components: {
 						}
 					}
 					type:              "distribution"
-					default_namespace: "vector"
+					default_namespace: string | *"vector"
 				}
 
 				_passthrough_gauge: {
@@ -1233,7 +1228,7 @@ components: {
 						}
 					}
 					type:              "gauge"
-					default_namespace: "vector"
+					default_namespace: string | *"vector"
 				}
 
 				_passthrough_histogram: {
@@ -1246,7 +1241,7 @@ components: {
 						}
 					}
 					type:              "gauge"
-					default_namespace: "vector"
+					default_namespace: string | *"vector"
 				}
 
 				_passthrough_set: {
@@ -1259,7 +1254,7 @@ components: {
 						}
 					}
 					type:              "gauge"
-					default_namespace: "vector"
+					default_namespace: string | *"vector"
 				}
 
 				_passthrough_summary: {
@@ -1272,16 +1267,8 @@ components: {
 						}
 					}
 					type:              "gauge"
-					default_namespace: "vector"
+					default_namespace: string | *"vector"
 				}
-			}
-		}
-
-		if Kind == "transform" {
-			telemetry: metrics: {
-				// Default metrics for each transform
-				processed_events_total: components.sources.internal_metrics.output.metrics.processed_events_total
-				processed_bytes_total:  components.sources.internal_metrics.output.metrics.processed_bytes_total
 			}
 		}
 

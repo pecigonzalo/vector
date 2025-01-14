@@ -1,7 +1,9 @@
-use async_trait::async_trait;
-use aws_smithy_client::SdkError;
+use std::future::Future;
+
+use aws_smithy_runtime_api::client::{orchestrator::HttpResponse, result::SdkError};
 use bytes::Bytes;
 
+use super::KinesisResponse;
 /// An AWS Kinesis record type primarily to store the underlying aws crates' actual record `T`, and
 /// to abstract the encoded length calculation.
 pub trait Record {
@@ -18,11 +20,14 @@ pub trait Record {
 }
 
 /// Capable of sending records.
-#[async_trait]
 pub trait SendRecord {
     type T;
     type E;
 
     /// Sends the records.
-    async fn send(&self, records: Vec<Self::T>, stream_name: String) -> Option<SdkError<Self::E>>;
+    fn send(
+        &self,
+        records: Vec<Self::T>,
+        stream_name: String,
+    ) -> impl Future<Output = Result<KinesisResponse, SdkError<Self::E, HttpResponse>>> + Send;
 }

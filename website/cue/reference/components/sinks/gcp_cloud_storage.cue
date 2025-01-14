@@ -6,7 +6,7 @@ components: sinks: gcp_cloud_storage: {
 	classes: {
 		commonly_used: true
 		delivery:      "at_least_once"
-		development:   "beta"
+		development:   "stable"
 		egress_method: "batch"
 		service_providers: ["GCP"]
 		stateful: false
@@ -141,6 +141,16 @@ components: sinks: gcp_cloud_storage: {
 				"""
 		}
 
+		retry_policy: {
+			title: "Retry policy"
+			body: """
+				Vector will retry failed requests (status == 401, == 408, == 429, >= 500, and != 501).
+				Other responses will not be retried. You can control the number of
+				retry attempts and backoff rate with the `request.retry_attempts` and
+				`request.retry_backoff_secs` options.
+				"""
+		}
+
 		storage_class: {
 			title: "Storage Class"
 			body:  """
@@ -179,11 +189,4 @@ components: sinks: gcp_cloud_storage: {
 			]
 		},
 	]
-
-	telemetry: metrics: {
-		component_sent_events_total:      components.sources.internal_metrics.output.metrics.component_sent_events_total
-		component_sent_event_bytes_total: components.sources.internal_metrics.output.metrics.component_sent_event_bytes_total
-		events_discarded_total:           components.sources.internal_metrics.output.metrics.events_discarded_total
-		processing_errors_total:          components.sources.internal_metrics.output.metrics.processing_errors_total
-	}
 }

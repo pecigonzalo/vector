@@ -31,7 +31,10 @@ components: sinks: databend: {
 			}
 			encoding: {
 				enabled: true
-				codec: enabled: false
+				codec: {
+					enabled: true
+					enum: ["json", "csv"]
+				}
 			}
 			proxy: enabled: true
 			request: {
@@ -66,7 +69,7 @@ components: sinks: databend: {
 	support: {
 		requirements: [
 			"""
-				[Databend](\(urls.databend)) version `>= 0.9.0` is required.
+				[Databend](\(urls.databend)) version `>= 1.2.216` is required.
 				""",
 		]
 		warnings: []
@@ -94,15 +97,8 @@ components: sinks: databend: {
 				    The `stage_path` generated from: `vector/{database}/{table}/{timestamp}-{random_suffix}`
 				2. Format data into ndjson, and upload directly into object storage with the presigned url.
 				3. Insert with the uploaded file with stage attachment in previous step.
-				    ref: https://databend.rs/doc/sql-commands/dml/dml-insert#insert-with-stage-attachment
+				    ref: https://docs.databend.com/developer/apis/http#stage-attachment
 				"""
 		}
-	}
-
-	telemetry: metrics: {
-		component_sent_bytes_total:       components.sources.internal_metrics.output.metrics.component_sent_bytes_total
-		component_sent_events_total:      components.sources.internal_metrics.output.metrics.component_sent_events_total
-		component_sent_event_bytes_total: components.sources.internal_metrics.output.metrics.component_sent_event_bytes_total
-		events_out_total:                 components.sources.internal_metrics.output.metrics.events_out_total
 	}
 }

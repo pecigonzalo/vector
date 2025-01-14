@@ -13,23 +13,27 @@
 #![deny(unused_comparisons)]
 
 #[cfg(feature = "btreemap")]
-pub use value::btreemap;
+pub use vrl::btreemap;
 
 #[cfg(feature = "byte_size_of")]
 pub mod byte_size_of;
 
+pub mod json_size;
+
 pub mod config;
 
+pub mod constants;
+
 #[cfg(feature = "conversion")]
-pub use vrl_core::TimeZone;
+pub use vrl::compiler::TimeZone;
 
 #[cfg(feature = "encoding")]
 pub mod encode_logfmt {
-    pub use vrl_core::encode_logfmt::*;
+    pub use vrl::core::encode_logfmt::*;
 }
 
 pub mod conversion {
-    pub use vrl_core::conversion::*;
+    pub use vrl::compiler::conversion::*;
 }
 
 pub mod event_data_eq;
@@ -41,6 +45,8 @@ pub mod event_test_util;
 pub mod finalization;
 pub mod finalizer;
 pub use finalizer::EmptyStream;
+
+pub mod id;
 
 pub mod internal_event;
 

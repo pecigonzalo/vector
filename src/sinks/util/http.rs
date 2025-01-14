@@ -12,25 +12,28 @@ use std::{
 use bytes::{Buf, Bytes};
 use futures::{future::BoxFuture, Sink};
 use headers::HeaderName;
-use http::{header, HeaderValue, StatusCode};
+use http::{header, HeaderValue, Request, Response, StatusCode};
 use hyper::{body, Body};
 use indexmap::IndexMap;
 use pin_project::pin_project;
 use snafu::{ResultExt, Snafu};
 use tower::{Service, ServiceBuilder};
 use tower_http::decompression::DecompressionLayer;
-use vector_config::configurable_component;
-use vector_core::ByteSizeOf;
+use vector_lib::configurable::configurable_component;
+use vector_lib::stream::batcher::limiter::ItemBatchSize;
+use vector_lib::{ByteSizeOf, EstimatedJsonEncodedSizeOf};
 
 use super::{
     retries::{RetryAction, RetryLogic},
-    sink, uri, Batch, EncodedEvent, Partition, TowerBatchedSink, TowerPartitionSink,
-    TowerRequestConfig, TowerRequestSettings,
+    sink::{self, Response as _},
+    uri, Batch, EncodedEvent, Partition, TowerBatchedSink, TowerPartitionSink, TowerRequestConfig,
+    TowerRequestSettings,
 };
 use crate::{
     event::Event,
     http::{HttpClient, HttpError},
     internal_events::{EndpointBytesSent, SinkRequestBuildError},
+    sinks::prelude::*,
 };
 
 pub trait HttpEventEncoder<Output> {
@@ -38,14 +41,16 @@ pub trait HttpEventEncoder<Output> {
     fn encode_event(&mut self, event: Event) -> Option<Output>;
 }
 
-#[async_trait::async_trait]
 pub trait HttpSink: Send + Sync + 'static {
     type Input;
     type Output;
     type Encoder: HttpEventEncoder<Self::Input>;
 
     fn build_encoder(&self) -> Self::Encoder;
-    async fn build_request(&self, events: Self::Output) -> crate::Result<http::Request<Bytes>>;
+    fn build_request(
+        &self,
+        events: Self::Output,
+    ) -> impl Future<Output = crate::Result<http::Request<Bytes>>> + Send;
 }
 
 /// Provides a simple wrapper around internal tower and
@@ -172,12 +177,14 @@ where
 
     fn start_send(mut self: Pin<&mut Self>, mut event: Event) -> Result<(), Self::Error> {
         let byte_size = event.size_of();
+        let json_byte_size = event.estimated_json_encoded_size_of();
         let finalizers = event.metadata_mut().take_finalizers();
         if let Some(item) = self.encoder.encode_event(event) {
             *self.project().slot = Some(EncodedEvent {
                 item,
                 finalizers,
                 byte_size,
+                json_byte_size,
             });
         }
 
@@ -323,11 +330,14 @@ where
     fn start_send(mut self: Pin<&mut Self>, mut event: Event) -> Result<(), Self::Error> {
         let finalizers = event.metadata_mut().take_finalizers();
         let byte_size = event.size_of();
+        let json_byte_size = event.estimated_json_encoded_size_of();
+
         if let Some(item) = self.encoder.encode_event(event) {
             *self.project().slot = Some(EncodedEvent {
                 item,
                 finalizers,
                 byte_size,
+                json_byte_size,
             });
         }
 
@@ -350,6 +360,12 @@ where
     }
 }
 
+/// @struct HttpBatchService
+///
+/// NOTE: This has been deprecated, please do not use directly when creating new sinks.
+///       The `HttpService` currently wraps this structure. Eventually all sinks currently using the
+///       HttpBatchService directly should be updated to use `HttpService`. At which time we can
+///       remove this struct and inline the functionality into the `HttpService` directly.
 pub struct HttpBatchService<F, B = Bytes> {
     inner: HttpClient<Body>,
     request_builder: Arc<dyn Fn(B) -> F + Send + Sync>,
@@ -385,9 +401,8 @@ where
         let http_client = self.inner.clone();
 
         Box::pin(async move {
-            let request = request_builder(body).await.map_err(|error| {
-                emit!(SinkRequestBuildError { error: &error });
-                error
+            let request = request_builder(body).await.inspect_err(|error| {
+                emit!(SinkRequestBuildError { error });
             })?;
             let byte_size = request.body().len();
             let request = request.map(Body::from);
@@ -398,7 +413,8 @@ where
                 .service(http_client);
 
             // Any errors raised in `http_client.call` results in a `GotHttpWarning` event being emitted
-            // in `HttpClient::send`.
+            // in `HttpClient::send`. This does not result in incrementing `component_errors_total` however,
+            // because that is incremented by the driver when retries have been exhausted.
             let response = decompression_service.call(request).await?;
 
             if response.status().is_success() {
@@ -454,6 +470,7 @@ impl RetryLogic for HttpRetryLogic {
 
         match status {
             StatusCode::TOO_MANY_REQUESTS => RetryAction::Retry("too many requests".into()),
+            StatusCode::REQUEST_TIMEOUT => RetryAction::Retry("request timeout".into()),
             StatusCode::NOT_IMPLEMENTED => {
                 RetryAction::DontRetry("endpoint not implemented".into())
             }
@@ -504,6 +521,7 @@ where
 
         match status {
             StatusCode::TOO_MANY_REQUESTS => RetryAction::Retry("too many requests".into()),
+            StatusCode::REQUEST_TIMEOUT => RetryAction::Retry("request timeout".into()),
             StatusCode::NOT_IMPLEMENTED => {
                 RetryAction::DontRetry("endpoint not implemented".into())
             }
@@ -545,13 +563,10 @@ pub struct RequestConfig {
 }
 
 fn headers_examples() -> IndexMap<String, String> {
-    IndexMap::<_, _>::from_iter(
-        [
-            ("Accept".to_owned(), "text/plain".to_owned()),
-            ("X-My-Custom-Header".to_owned(), "A-Value".to_owned()),
-        ]
-        .into_iter(),
-    )
+    IndexMap::<_, _>::from_iter([
+        ("Accept".to_owned(), "text/plain".to_owned()),
+        ("X-My-Custom-Header".to_owned(), "A-Value".to_owned()),
+    ])
 }
 
 impl RequestConfig {
@@ -593,6 +608,175 @@ pub fn validate_headers(
     Ok(validated_headers)
 }
 
+/// Request type for use in the `Service` implementation of HTTP stream sinks.
+#[derive(Clone)]
+pub struct HttpRequest<T: Send> {
+    payload: Bytes,
+    finalizers: EventFinalizers,
+    request_metadata: RequestMetadata,
+    additional_metadata: T,
+}
+
+impl<T: Send> HttpRequest<T> {
+    /// Creates a new `HttpRequest`.
+    pub const fn new(
+        payload: Bytes,
+        finalizers: EventFinalizers,
+        request_metadata: RequestMetadata,
+        additional_metadata: T,
+    ) -> Self {
+        Self {
+            payload,
+            finalizers,
+            request_metadata,
+            additional_metadata,
+        }
+    }
+
+    pub const fn get_additional_metadata(&self) -> &T {
+        &self.additional_metadata
+    }
+
+    pub fn take_payload(&mut self) -> Bytes {
+        std::mem::take(&mut self.payload)
+    }
+}
+
+impl<T: Send> Finalizable for HttpRequest<T> {
+    fn take_finalizers(&mut self) -> EventFinalizers {
+        self.finalizers.take_finalizers()
+    }
+}
+
+impl<T: Send> MetaDescriptive for HttpRequest<T> {
+    fn get_metadata(&self) -> &RequestMetadata {
+        &self.request_metadata
+    }
+
+    fn metadata_mut(&mut self) -> &mut RequestMetadata {
+        &mut self.request_metadata
+    }
+}
+
+impl<T: Send> ByteSizeOf for HttpRequest<T> {
+    fn allocated_bytes(&self) -> usize {
+        self.payload.allocated_bytes() + self.finalizers.allocated_bytes()
+    }
+}
+
+/// Response type for use in the `Service` implementation of HTTP stream sinks.
+pub struct HttpResponse {
+    pub http_response: Response<Bytes>,
+    pub events_byte_size: GroupedCountByteSize,
+    pub raw_byte_size: usize,
+}
+
+impl DriverResponse for HttpResponse {
+    fn event_status(&self) -> EventStatus {
+        if self.http_response.is_successful() {
+            EventStatus::Delivered
+        } else if self.http_response.is_transient() {
+            EventStatus::Errored
+        } else {
+            EventStatus::Rejected
+        }
+    }
+
+    fn events_sent(&self) -> &GroupedCountByteSize {
+        &self.events_byte_size
+    }
+
+    fn bytes_sent(&self) -> Option<usize> {
+        Some(self.raw_byte_size)
+    }
+}
+
+/// Creates a `RetryLogic` for use with `HttpResponse`.
+pub fn http_response_retry_logic() -> HttpStatusRetryLogic<
+    impl Fn(&HttpResponse) -> StatusCode + Clone + Send + Sync + 'static,
+    HttpResponse,
+> {
+    HttpStatusRetryLogic::new(|req: &HttpResponse| req.http_response.status())
+}
+
+/// Uses the estimated json encoded size to determine batch sizing.
+#[derive(Default)]
+pub struct HttpJsonBatchSizer;
+
+impl ItemBatchSize<Event> for HttpJsonBatchSizer {
+    fn size(&self, item: &Event) -> usize {
+        item.estimated_json_encoded_size_of().get()
+    }
+}
+
+/// HTTP request builder for HTTP stream sinks using the generic `HttpService`
+pub trait HttpServiceRequestBuilder<T: Send> {
+    fn build(&self, request: HttpRequest<T>) -> Result<Request<Bytes>, crate::Error>;
+}
+
+/// Generic 'Service' implementation for HTTP stream sinks.
+#[derive(Clone)]
+pub struct HttpService<B, T: Send> {
+    batch_service:
+        HttpBatchService<BoxFuture<'static, Result<Request<Bytes>, crate::Error>>, HttpRequest<T>>,
+    _phantom: PhantomData<B>,
+}
+
+impl<B, T: Send + 'static> HttpService<B, T>
+where
+    B: HttpServiceRequestBuilder<T> + std::marker::Sync + std::marker::Send + 'static,
+{
+    pub fn new(http_client: HttpClient<Body>, http_request_builder: B) -> Self {
+        let http_request_builder = Arc::new(http_request_builder);
+
+        let batch_service = HttpBatchService::new(http_client, move |req: HttpRequest<T>| {
+            let request_builder = Arc::clone(&http_request_builder);
+
+            let fut: BoxFuture<'static, Result<http::Request<Bytes>, crate::Error>> =
+                Box::pin(async move { request_builder.build(req) });
+
+            fut
+        });
+        Self {
+            batch_service,
+            _phantom: PhantomData,
+        }
+    }
+}
+
+impl<B, T: Send + 'static> Service<HttpRequest<T>> for HttpService<B, T>
+where
+    B: HttpServiceRequestBuilder<T> + std::marker::Sync + std::marker::Send + 'static,
+{
+    type Response = HttpResponse;
+    type Error = crate::Error;
+    type Future = BoxFuture<'static, Result<Self::Response, Self::Error>>;
+
+    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, mut request: HttpRequest<T>) -> Self::Future {
+        let mut http_service = self.batch_service.clone();
+
+        // NOTE: By taking the metadata here, when passing the request to `call()` below,
+        //       that function does not have access to the metadata anymore.
+        let metadata = std::mem::take(request.metadata_mut());
+        let raw_byte_size = metadata.request_encoded_size();
+        let events_byte_size = metadata.into_events_estimated_json_encoded_byte_size();
+
+        Box::pin(async move {
+            let http_response = http_service.call(request).await?;
+
+            Ok(HttpResponse {
+                http_response,
+                events_byte_size,
+                raw_byte_size,
+            })
+        })
+    }
+}
+
 #[cfg(test)]
 mod test {
     #![allow(clippy::print_stderr)] //tests
@@ -610,13 +794,14 @@ mod test {
     fn util_http_retry_logic() {
         let logic = HttpRetryLogic;
 
+        let response_408 = Response::builder().status(408).body(Bytes::new()).unwrap();
         let response_429 = Response::builder().status(429).body(Bytes::new()).unwrap();
         let response_500 = Response::builder().status(500).body(Bytes::new()).unwrap();
         let response_400 = Response::builder().status(400).body(Bytes::new()).unwrap();
         let response_501 = Response::builder().status(501).body(Bytes::new()).unwrap();
-
         assert!(logic.should_retry_response(&response_429).is_retryable());
         assert!(logic.should_retry_response(&response_500).is_retryable());
+        assert!(logic.should_retry_response(&response_408).is_retryable());
         assert!(logic
             .should_retry_response(&response_400)
             .is_not_retryable());

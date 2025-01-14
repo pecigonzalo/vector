@@ -6,7 +6,7 @@ components: sources: kubernetes_logs: {
 	title: "Kubernetes Logs"
 
 	description: """
-		Collects Pod logs from Kubernetes Nodes, automatically enriching data
+		Collects Pod logs Vector's host Kubernetes Node, automatically enriching data
 		with metadata via the Kubernetes API.
 		"""
 
@@ -47,7 +47,9 @@ components: sources: kubernetes_logs: {
 				Kubernetes cluster this can be provided with a [hostPath](\(urls.kubernetes_host_path)) volume.
 				""",
 		]
-		warnings: []
+		warnings: ["""
+				This source is only tested on Linux. Your mileage may vary for clusters on Windows.
+			"""]
 		notices: []
 	}
 
@@ -277,8 +279,12 @@ components: sources: kubernetes_logs: {
 
 				* Built-in [Pod](#pod-exclusion) and [Container](#container-exclusion)
 				  exclusion rules.
+				* The `include_paths_glob_patterns` option allows you to include
+				  Kubernetes log files by the file name and path.
 				* The `exclude_paths_glob_patterns` option allows you to exclude
 				  Kubernetes log files by the file name and path.
+				* The `include_paths_glob_patterns` option defaults to `include all` and is
+				  evaluated before the `exclude_paths_glob_patterns` option.
 				* The `extra_field_selector` option specifies the field selector to
 				  filter Pods with, to be used in addition to the built-in Node filter.
 				* The `extra_label_selector` option specifies the label selector to
@@ -465,25 +471,7 @@ components: sources: kubernetes_logs: {
 	}
 
 	telemetry: metrics: {
-		events_in_total:                        components.sources.internal_metrics.output.metrics.events_in_total
 		k8s_format_picker_edge_cases_total:     components.sources.internal_metrics.output.metrics.k8s_format_picker_edge_cases_total
 		k8s_docker_format_parse_failures_total: components.sources.internal_metrics.output.metrics.k8s_docker_format_parse_failures_total
-		k8s_event_annotation_failures_total:    components.sources.internal_metrics.output.metrics.k8s_event_annotation_failures_total
-		k8s_reflector_desyncs_total:            components.sources.internal_metrics.output.metrics.k8s_reflector_desyncs_total
-		k8s_state_ops_total:                    components.sources.internal_metrics.output.metrics.k8s_state_ops_total
-		k8s_stream_chunks_processed_total:      components.sources.internal_metrics.output.metrics.k8s_stream_chunks_processed_total
-		k8s_stream_processed_bytes_total:       components.sources.internal_metrics.output.metrics.k8s_stream_processed_bytes_total
-		k8s_watch_requests_invoked_total:       components.sources.internal_metrics.output.metrics.k8s_watch_requests_invoked_total
-		k8s_watch_requests_failed_total:        components.sources.internal_metrics.output.metrics.k8s_watch_requests_failed_total
-		k8s_watch_stream_failed_total:          components.sources.internal_metrics.output.metrics.k8s_watch_stream_failed_total
-		k8s_watch_stream_items_obtained_total:  components.sources.internal_metrics.output.metrics.k8s_watch_stream_items_obtained_total
-		k8s_watcher_http_error_total:           components.sources.internal_metrics.output.metrics.k8s_watcher_http_error_total
-		processed_bytes_total:                  components.sources.internal_metrics.output.metrics.processed_bytes_total
-		processed_events_total:                 components.sources.internal_metrics.output.metrics.processed_events_total
-		component_discarded_events_total:       components.sources.internal_metrics.output.metrics.component_discarded_events_total
-		component_errors_total:                 components.sources.internal_metrics.output.metrics.component_errors_total
-		component_received_bytes_total:         components.sources.internal_metrics.output.metrics.component_received_bytes_total
-		component_received_event_bytes_total:   components.sources.internal_metrics.output.metrics.component_received_event_bytes_total
-		component_received_events_total:        components.sources.internal_metrics.output.metrics.component_received_events_total
 	}
 }

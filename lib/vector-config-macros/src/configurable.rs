@@ -2,7 +2,7 @@ use proc_macro::TokenStream;
 use proc_macro2::Span;
 use quote::{quote, quote_spanned};
 use syn::{
-    parse_macro_input, parse_quote, spanned::Spanned, token::Colon2, DeriveInput, ExprPath, Ident,
+    parse_macro_input, parse_quote, spanned::Spanned, token::PathSep, DeriveInput, ExprPath, Ident,
     PathArguments, Type,
 };
 use vector_config_common::validation::Validation;
@@ -647,10 +647,10 @@ fn get_metadata_custom_attributes(
     let mapped_custom_attributes = custom_attributes
         .map(|attr| match attr {
             LazyCustomAttribute::Flag(key) => quote! {
-                #meta_ident.add_custom_attribute(::vector_config_common::attributes::CustomAttribute::flag(#key));
+                #meta_ident.add_custom_attribute(::vector_config::attributes::CustomAttribute::flag(#key));
             },
             LazyCustomAttribute::KeyValue { key, value } => quote! {
-                #meta_ident.add_custom_attribute(::vector_config_common::attributes::CustomAttribute::kv(
+                #meta_ident.add_custom_attribute(::vector_config::attributes::CustomAttribute::kv(
                     #key, #value
                 ));
             },
@@ -1058,7 +1058,7 @@ fn get_ty_for_expr_pos(ty: &syn::Type) -> syn::Type {
             let mut new_tp = tp.clone();
             for segment in new_tp.path.segments.iter_mut() {
                 if let PathArguments::AngleBracketed(ab) = &mut segment.arguments {
-                    ab.colon2_token = Some(Colon2::default());
+                    ab.colon2_token = Some(PathSep::default());
                 }
             }
 

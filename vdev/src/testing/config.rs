@@ -3,14 +3,17 @@ use std::path::{Path, PathBuf};
 use std::{env, fs};
 
 use anyhow::{bail, Context, Result};
-use hashlink::LinkedHashMap;
+use indexmap::IndexMap;
 use itertools::{self, Itertools};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_yaml::Value;
 
 use crate::{app, util};
 
 const FILE_NAME: &str = "test.yaml";
+
+pub const INTEGRATION_TESTS_DIR: &str = "integration";
+pub const E2E_TESTS_DIR: &str = "e2e";
 
 pub type Environment = BTreeMap<String, Option<String>>;
 
@@ -37,20 +40,56 @@ impl RustToolchainConfig {
     }
 }
 
-#[derive(Debug, Deserialize)]
-pub struct ComposeConfig {
-    pub services: BTreeMap<String, ComposeService>,
-    #[serde(default)]
-    pub volumes: BTreeMap<String, Value>,
+pub fn get_rust_version() -> String {
+    match RustToolchainConfig::parse() {
+        Ok(config) => config.channel,
+        Err(error) => fatal!("Could not read `rust-toolchain.toml` file: {error}"),
+    }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
+pub struct ComposeConfig {
+    pub services: BTreeMap<String, ComposeService>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub volumes: BTreeMap<String, Value>,
+    #[serde(default)]
+    pub networks: BTreeMap<String, BTreeMap<String, String>>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
 pub struct ComposeService {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hostname: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub container_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<Command>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ports: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub env_file: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub volumes: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub environment: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub depends_on: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub healthcheck: Option<Value>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum Command {
+    Single(String),
+    Multiple(Vec<String>),
 }
 
 impl ComposeConfig {
-    #[cfg(unix)]
     pub fn parse(path: &Path) -> Result<Self> {
         let contents =
             fs::read_to_string(path).with_context(|| format!("failed to read {path:?}"))?;
@@ -60,7 +99,7 @@ impl ComposeConfig {
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct IntegrationTestConfig {
+pub struct ComposeTestConfig {
     /// The list of arguments to add to the command line for the test runner
     pub args: Option<Vec<String>>,
     /// The set of environment variables to set in both the services and the runner. Variables with
@@ -69,7 +108,7 @@ pub struct IntegrationTestConfig {
     #[serde(default)]
     pub env: Environment,
     /// The matrix of environment configurations values.
-    matrix: LinkedHashMap<String, Vec<String>>,
+    matrix: IndexMap<String, Vec<String>>,
     /// Configuration specific to the compose services.
     #[serde(default)]
     pub runner: IntegrationRunnerConfig,
@@ -79,14 +118,15 @@ pub struct IntegrationTestConfig {
     pub test: Option<String>,
 
     pub test_filter: Option<String>,
+
+    pub paths: Option<Vec<String>>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct IntegrationRunnerConfig {
     /// The set of environment variables to set in just the runner. This is used for settings that
-    /// might otherwise affect the operation of either docker or docker-compose but are needed in
-    /// the runner.
+    /// might otherwise affect the operation of docker but are needed in the runner.
     #[serde(default)]
     pub env: Environment,
     /// The set of volumes that need to be mounted into the runner.
@@ -97,11 +137,11 @@ pub struct IntegrationRunnerConfig {
     pub needs_docker_socket: bool,
 }
 
-impl IntegrationTestConfig {
+impl ComposeTestConfig {
     fn parse_file(config_file: &Path) -> Result<Self> {
         let contents = fs::read_to_string(config_file)
             .with_context(|| format!("failed to read {}", config_file.display()))?;
-        let config: IntegrationTestConfig = serde_yaml::from_str(&contents).with_context(|| {
+        let config: Self = serde_yaml::from_str(&contents).with_context(|| {
             format!(
                 "failed to parse integration test configuration file {}",
                 config_file.display()
@@ -111,7 +151,7 @@ impl IntegrationTestConfig {
         Ok(config)
     }
 
-    pub fn environments(&self) -> LinkedHashMap<String, Environment> {
+    pub fn environments(&self) -> IndexMap<String, Environment> {
         self.matrix
             .values()
             .multi_cartesian_product()
@@ -120,7 +160,7 @@ impl IntegrationTestConfig {
                 let config: Environment = self
                     .matrix
                     .keys()
-                    .zip(product.into_iter())
+                    .zip(product)
                     .map(|(variable, value)| (variable.clone(), Some(value.clone())))
                     .collect();
                 (key, config)
@@ -128,10 +168,11 @@ impl IntegrationTestConfig {
             .collect()
     }
 
-    pub fn load(integration: &str) -> Result<(PathBuf, Self)> {
-        let test_dir: PathBuf = [app::path(), "scripts", "integration", integration]
+    pub fn load(root_dir: &str, integration: &str) -> Result<(PathBuf, Self)> {
+        let test_dir: PathBuf = [app::path(), "scripts", root_dir, integration]
             .iter()
             .collect();
+
         if !test_dir.is_dir() {
             bail!("unknown integration: {}", integration);
         }
@@ -140,9 +181,7 @@ impl IntegrationTestConfig {
         Ok((test_dir, config))
     }
 
-    pub fn collect_all() -> Result<BTreeMap<String, Self>> {
-        let mut configs = BTreeMap::new();
-        let tests_dir: PathBuf = [app::path(), "scripts", "integration"].iter().collect();
+    fn collect_all_dir(tests_dir: &Path, configs: &mut BTreeMap<String, Self>) -> Result<()> {
         for entry in tests_dir.read_dir()? {
             let entry = entry?;
             if entry.path().is_dir() {
@@ -154,6 +193,15 @@ impl IntegrationTestConfig {
                 }
             }
         }
+        Ok(())
+    }
+
+    pub fn collect_all(root_dir: &str) -> Result<BTreeMap<String, Self>> {
+        let mut configs = BTreeMap::new();
+
+        let tests_dir: PathBuf = [app::path(), "scripts", root_dir].iter().collect();
+
+        Self::collect_all_dir(&tests_dir, &mut configs)?;
 
         Ok(configs)
     }

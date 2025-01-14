@@ -3,23 +3,21 @@ pub mod udp;
 #[cfg(unix)]
 mod unix;
 
-use codecs::{decoding::DeserializerConfig, NewlineDelimitedDecoderConfig};
-use lookup::{lookup_v2::OptionalValuePath, owned_value_path};
-use value::{kind::Collection, Kind};
-use vector_config::configurable_component;
-use vector_core::config::{log_schema, LegacyKey, LogNamespace};
+use vector_lib::codecs::decoding::DeserializerConfig;
+use vector_lib::config::{log_schema, LegacyKey, LogNamespace};
+use vector_lib::configurable::configurable_component;
+use vector_lib::lookup::{lookup_v2::OptionalValuePath, owned_value_path};
+use vrl::value::{kind::Collection, Kind};
 
-#[cfg(unix)]
-use crate::serde::default_framing_message_based;
 use crate::{
     codecs::DecodingConfig,
-    config::{GenerateConfig, Output, Resource, SourceConfig, SourceContext},
+    config::{GenerateConfig, Resource, SourceConfig, SourceContext, SourceOutput},
     sources::util::net::TcpSource,
     tls::MaybeTlsSettings,
 };
 
 /// Configuration for the `socket` source.
-#[configurable_component(source("socket"))]
+#[configurable_component(source("socket", "Collect logs over a socket."))]
 #[derive(Clone, Debug)]
 pub struct SocketConfig {
     #[serde(flatten)]
@@ -69,14 +67,14 @@ impl SocketConfig {
         }
     }
 
-    fn log_namespace(&self) -> LogNamespace {
+    fn log_namespace(&self, global_log_namespace: LogNamespace) -> LogNamespace {
         match &self.mode {
-            Mode::Tcp(config) => config.log_namespace.unwrap_or(false).into(),
-            Mode::Udp(config) => config.log_namespace.unwrap_or(false).into(),
+            Mode::Tcp(config) => global_log_namespace.merge(config.log_namespace),
+            Mode::Udp(config) => global_log_namespace.merge(config.log_namespace),
             #[cfg(unix)]
-            Mode::UnixDatagram(config) => config.log_namespace.unwrap_or(false).into(),
+            Mode::UnixDatagram(config) => global_log_namespace.merge(config.log_namespace),
             #[cfg(unix)]
-            Mode::UnixStream(config) => config.log_namespace.unwrap_or(false).into(),
+            Mode::UnixStream(config) => global_log_namespace.merge(config.log_namespace),
         }
     }
 }
@@ -108,30 +106,23 @@ impl GenerateConfig for SocketConfig {
 }
 
 #[async_trait::async_trait]
+#[typetag::serde(name = "socket")]
 impl SourceConfig for SocketConfig {
     async fn build(&self, cx: SourceContext) -> crate::Result<super::Source> {
         match self.mode.clone() {
             Mode::Tcp(config) => {
-                let decoding = config.decoding().clone();
-                // TODO: in v0.30.0 , remove the `max_length` setting from
-                // the UnixConfig, and all of the below mess and replace
-                // it with the configured framing /
-                // decoding.default_stream_framing().
-                let framing = match (config.framing().clone(), config.max_length()) {
-                    (Some(framing), Some(_)) => {
-                        warn!(message = "DEPRECATION: The `max_length` setting is deprecated and will be removed in an upcoming release. Since a `framing` setting was provided, the `max_length` setting has no effect.");
-                        framing
-                    }
-                    (Some(framing), None) => framing,
-                    (None, Some(max_length)) => {
-                        warn!(message = "DEPRECATION: The `max_length` setting is deprecated and will be removed in an upcoming release. Please configure the `max_length` from the `framing` setting instead.");
-                        NewlineDelimitedDecoderConfig::new_with_max_length(max_length).into()
-                    }
-                    (None, None) => decoding.default_stream_framing(),
-                };
-
                 let log_namespace = cx.log_namespace(config.log_namespace);
-                let decoder = DecodingConfig::new(framing, decoding, log_namespace).build();
+
+                let decoding = config.decoding().clone();
+                let decoder = DecodingConfig::new(
+                    config
+                        .framing
+                        .clone()
+                        .unwrap_or_else(|| decoding.default_stream_framing()),
+                    decoding,
+                    log_namespace,
+                )
+                .build()?;
 
                 let tcp = tcp::RawTcpSource::new(config.clone(), decoder, log_namespace);
                 let tls_config = config.tls().as_ref().map(|tls| tls.tls_config.clone());
@@ -140,7 +131,7 @@ impl SourceConfig for SocketConfig {
                     .as_ref()
                     .and_then(|tls| tls.client_metadata_key.clone())
                     .and_then(|k| k.path);
-                let tls = MaybeTlsSettings::from_config(&tls_config, true)?;
+                let tls = MaybeTlsSettings::from_config(tls_config.as_ref(), true)?;
                 tcp.run(
                     config.address(),
                     config.keepalive(),
@@ -152,18 +143,19 @@ impl SourceConfig for SocketConfig {
                     cx,
                     false.into(),
                     config.connection_limit,
+                    config.permit_origin.map(Into::into),
                     SocketConfig::NAME,
                     log_namespace,
                 )
             }
             Mode::Udp(config) => {
                 let log_namespace = cx.log_namespace(config.log_namespace);
-                let decoder = DecodingConfig::new(
-                    config.framing().clone(),
-                    config.decoding().clone(),
-                    log_namespace,
-                )
-                .build();
+                let decoding = config.decoding().clone();
+                let framing = config
+                    .framing()
+                    .clone()
+                    .unwrap_or_else(|| decoding.default_message_based_framing());
+                let decoder = DecodingConfig::new(framing, decoding, log_namespace).build()?;
                 Ok(udp::udp(
                     config,
                     decoder,
@@ -175,49 +167,37 @@ impl SourceConfig for SocketConfig {
             #[cfg(unix)]
             Mode::UnixDatagram(config) => {
                 let log_namespace = cx.log_namespace(config.log_namespace);
-                let decoder = DecodingConfig::new(
-                    config
-                        .framing
-                        .clone()
-                        .unwrap_or_else(default_framing_message_based),
-                    config.decoding.clone(),
-                    log_namespace,
-                )
-                .build();
+                let decoding = config.decoding.clone();
+                let framing = config
+                    .framing
+                    .clone()
+                    .unwrap_or_else(|| decoding.default_message_based_framing());
+                let decoder = DecodingConfig::new(framing, decoding, log_namespace).build()?;
 
                 unix::unix_datagram(config, decoder, cx.shutdown, cx.out, log_namespace)
             }
             #[cfg(unix)]
             Mode::UnixStream(config) => {
-                let decoding = config.decoding.clone();
-
-                // TODO: in v0.30.0 , remove the `max_length` setting from
-                // the UnixConfig, and all of the below mess and replace
-                // it with the configured framing /
-                // decoding.default_stream_framing().
-                let framing = match (config.framing.clone(), config.max_length) {
-                    (Some(framing), Some(_)) => {
-                        warn!(message = "DEPRECATION: The `max_length` setting is deprecated and will be removed in an upcoming release. Since a `framing` setting was provided, the `max_length` setting has no effect.");
-                        framing
-                    }
-                    (Some(framing), None) => framing,
-                    (None, Some(max_length)) => {
-                        warn!(message = "DEPRECATION: The `max_length` setting is deprecated and will be removed in an upcoming release. Please configure the `max_length` from the `framing` setting instead.");
-                        NewlineDelimitedDecoderConfig::new_with_max_length(max_length).into()
-                    }
-                    (None, None) => decoding.default_stream_framing(),
-                };
-
                 let log_namespace = cx.log_namespace(config.log_namespace);
-                let decoder = DecodingConfig::new(framing, decoding, log_namespace).build();
+
+                let decoding = config.decoding().clone();
+                let decoder = DecodingConfig::new(
+                    config
+                        .framing
+                        .clone()
+                        .unwrap_or_else(|| decoding.default_stream_framing()),
+                    decoding,
+                    log_namespace,
+                )
+                .build()?;
 
                 unix::unix_stream(config, decoder, cx.shutdown, cx.out, log_namespace)
             }
         }
     }
 
-    fn outputs(&self, global_log_namespace: LogNamespace) -> Vec<Output> {
-        let log_namespace = global_log_namespace.merge(Some(self.log_namespace()));
+    fn outputs(&self, global_log_namespace: LogNamespace) -> Vec<SourceOutput> {
+        let log_namespace = self.log_namespace(global_log_namespace);
 
         let schema_definition = self
             .decoding()
@@ -226,7 +206,7 @@ impl SourceConfig for SocketConfig {
 
         let schema_definition = match &self.mode {
             Mode::Tcp(config) => {
-                let legacy_host_key = config.host_key().clone().path.map(LegacyKey::InsertIfEmpty);
+                let legacy_host_key = config.host_key().path.map(LegacyKey::InsertIfEmpty);
 
                 let legacy_port_key = config.port_key().clone().path.map(LegacyKey::InsertIfEmpty);
 
@@ -249,7 +229,7 @@ impl SourceConfig for SocketConfig {
                         Self::NAME,
                         legacy_port_key,
                         &owned_value_path!("port"),
-                        Kind::bytes(),
+                        Kind::integer(),
                         None,
                     )
                     .with_source_metadata(
@@ -262,7 +242,7 @@ impl SourceConfig for SocketConfig {
                     )
             }
             Mode::Udp(config) => {
-                let legacy_host_key = config.host_key().clone().path.map(LegacyKey::InsertIfEmpty);
+                let legacy_host_key = config.host_key().path.map(LegacyKey::InsertIfEmpty);
 
                 let legacy_port_key = config.port_key().clone().path.map(LegacyKey::InsertIfEmpty);
 
@@ -278,7 +258,7 @@ impl SourceConfig for SocketConfig {
                         Self::NAME,
                         legacy_port_key,
                         &owned_value_path!("port"),
-                        Kind::bytes(),
+                        Kind::integer(),
                         None,
                     )
             }
@@ -308,8 +288,10 @@ impl SourceConfig for SocketConfig {
             }
         };
 
-        vec![Output::default(self.decoding().output_type())
-            .with_schema_definition(schema_definition)]
+        vec![SourceOutput::new_maybe_logs(
+            self.decoding().output_type(),
+            schema_definition,
+        )]
     }
 
     fn resources(&self) -> Vec<Resource> {
@@ -329,18 +311,14 @@ impl SourceConfig for SocketConfig {
 }
 
 pub(crate) fn default_host_key() -> OptionalValuePath {
-    OptionalValuePath::from(owned_value_path!(log_schema().host_key()))
-}
-
-fn default_max_length() -> Option<usize> {
-    Some(crate::serde::default_max_length())
+    log_schema().host_key().cloned().into()
 }
 
 #[cfg(test)]
 mod test {
     use approx::assert_relative_eq;
     use std::{
-        collections::{BTreeMap, HashMap},
+        collections::HashMap,
         net::{SocketAddr, UdpSocket},
         sync::{
             atomic::{AtomicBool, Ordering},
@@ -350,19 +328,25 @@ mod test {
     };
 
     use bytes::{BufMut, Bytes, BytesMut};
-    use codecs::NewlineDelimitedDecoderConfig;
-    #[cfg(unix)]
-    use codecs::{decoding::CharacterDelimitedDecoderOptions, CharacterDelimitedDecoderConfig};
     use futures::{stream, StreamExt};
-    use lookup::{lookup_v2::OptionalValuePath, owned_value_path, path};
+    use rand::{rngs::SmallRng, seq::SliceRandom, SeedableRng};
+    use serde_json::json;
     use tokio::io::AsyncReadExt;
     use tokio::net::TcpStream;
     use tokio::{
         task::JoinHandle,
         time::{timeout, Duration, Instant},
     };
-    use value::btreemap;
-    use vector_core::event::EventContainer;
+    #[cfg(unix)]
+    use vector_lib::codecs::{
+        decoding::CharacterDelimitedDecoderOptions, CharacterDelimitedDecoderConfig,
+    };
+    use vector_lib::codecs::{GelfDeserializerConfig, NewlineDelimitedDecoderConfig};
+    use vector_lib::event::EventContainer;
+    use vector_lib::lookup::{lookup_v2::OptionalValuePath, owned_value_path, path};
+    use vrl::value::ObjectMap;
+    use vrl::{btreemap, value};
+
     #[cfg(unix)]
     use {
         super::{unix::UnixConfig, Mode},
@@ -389,12 +373,59 @@ mod test {
         sources::util::net::SocketListenAddr,
         test_util::{
             collect_n, collect_n_limited,
-            components::{assert_source_compliance, SOCKET_HIGH_CARDINALITY_PUSH_SOURCE_TAGS},
+            components::{assert_source_compliance, SOCKET_PUSH_SOURCE_TAGS},
             next_addr, random_string, send_lines, send_lines_tls, wait_for_tcp,
         },
         tls::{self, TlsConfig, TlsEnableableConfig, TlsSourceConfig},
         SourceSender,
     };
+
+    fn get_gelf_payload(message: &str) -> String {
+        serde_json::to_string(&json!({
+            "version": "1.1",
+            "host": "example.org",
+            "short_message": message,
+            "timestamp": 1234567890.123,
+            "level": 6,
+            "_foo": "bar",
+        }))
+        .unwrap()
+    }
+
+    fn create_gelf_chunk(
+        message_id: u64,
+        sequence_number: u8,
+        total_chunks: u8,
+        payload: &[u8],
+    ) -> Bytes {
+        const GELF_MAGIC: [u8; 2] = [0x1e, 0x0f];
+        let mut chunk = BytesMut::new();
+        chunk.put_slice(&GELF_MAGIC);
+        chunk.put_u64(message_id);
+        chunk.put_u8(sequence_number);
+        chunk.put_u8(total_chunks);
+        chunk.put(payload);
+        chunk.freeze()
+    }
+
+    fn get_gelf_chunks(short_message: &str, max_size: usize, rng: &mut SmallRng) -> Vec<Bytes> {
+        let message_id = rand::random();
+        let payload = get_gelf_payload(short_message);
+        let payload_chunks = payload.as_bytes().chunks(max_size).collect::<Vec<_>>();
+        let total_chunks = payload_chunks.len();
+        assert!(total_chunks <= 128, "too many gelf chunks");
+
+        let mut chunks = payload_chunks
+            .into_iter()
+            .enumerate()
+            .map(|(i, payload_chunk)| {
+                create_gelf_chunk(message_id, i as u8, total_chunks as u8, payload_chunk)
+            })
+            .collect::<Vec<_>>();
+        // Shuffle the chunks to simulate out-of-order delivery
+        chunks.shuffle(rng);
+        chunks
+    }
 
     #[test]
     fn generate_config() {
@@ -404,7 +435,7 @@ mod test {
     //////// TCP TESTS ////////
     #[tokio::test]
     async fn tcp_it_includes_host() {
-        assert_source_compliance(&SOCKET_HIGH_CARDINALITY_PUSH_SOURCE_TAGS, async {
+        assert_source_compliance(&SOCKET_PUSH_SOURCE_TAGS, async {
             let (tx, mut rx) = SourceSender::new_test();
             let addr = next_addr();
 
@@ -429,7 +460,7 @@ mod test {
 
     #[tokio::test]
     async fn tcp_it_includes_vector_namespaced_fields() {
-        assert_source_compliance(&SOCKET_HIGH_CARDINALITY_PUSH_SOURCE_TAGS, async {
+        assert_source_compliance(&SOCKET_PUSH_SOURCE_TAGS, async {
             let (tx, mut rx) = SourceSender::new_test();
             let addr = next_addr();
             let mut conf = TcpConfig::from_address(addr.into());
@@ -453,15 +484,15 @@ mod test {
             assert_eq!(log.value(), &"test".into());
             assert_eq!(
                 event_meta.get(path!("vector", "source_type")).unwrap(),
-                &vrl::value!(SocketConfig::NAME)
+                &value!(SocketConfig::NAME)
             );
             assert_eq!(
                 event_meta.get(path!(SocketConfig::NAME, "host")).unwrap(),
-                &vrl::value!(addr.ip().to_string())
+                &value!(addr.ip().to_string())
             );
             assert_eq!(
                 event_meta.get(path!(SocketConfig::NAME, "port")).unwrap(),
-                &vrl::value!(addr.port())
+                &value!(addr.port())
             );
         })
         .await;
@@ -469,7 +500,7 @@ mod test {
 
     #[tokio::test]
     async fn tcp_splits_on_newline() {
-        assert_source_compliance(&SOCKET_HIGH_CARDINALITY_PUSH_SOURCE_TAGS, async {
+        assert_source_compliance(&SOCKET_PUSH_SOURCE_TAGS, async {
             let (tx, rx) = SourceSender::new_test();
             let addr = next_addr();
 
@@ -487,15 +518,21 @@ mod test {
             let events = collect_n(rx, 2).await;
 
             assert_eq!(events.len(), 2);
-            assert_eq!(events[0].as_log()[log_schema().message_key()], "foo".into());
-            assert_eq!(events[1].as_log()[log_schema().message_key()], "bar".into());
+            assert_eq!(
+                events[0].as_log()[log_schema().message_key().unwrap().to_string()],
+                "foo".into()
+            );
+            assert_eq!(
+                events[1].as_log()[log_schema().message_key().unwrap().to_string()],
+                "bar".into()
+            );
         })
         .await;
     }
 
     #[tokio::test]
     async fn tcp_it_includes_source_type() {
-        assert_source_compliance(&SOCKET_HIGH_CARDINALITY_PUSH_SOURCE_TAGS, async {
+        assert_source_compliance(&SOCKET_PUSH_SOURCE_TAGS, async {
             let (tx, mut rx) = SourceSender::new_test();
             let addr = next_addr();
 
@@ -512,7 +549,7 @@ mod test {
 
             let event = rx.next().await.unwrap();
             assert_eq!(
-                event.as_log()[log_schema().source_type_key()],
+                event.as_log()[log_schema().source_type_key().unwrap().to_string()],
                 "socket".into()
             );
         })
@@ -521,12 +558,11 @@ mod test {
 
     #[tokio::test]
     async fn tcp_continue_after_long_line() {
-        assert_source_compliance(&SOCKET_HIGH_CARDINALITY_PUSH_SOURCE_TAGS, async {
+        assert_source_compliance(&SOCKET_PUSH_SOURCE_TAGS, async {
             let (tx, mut rx) = SourceSender::new_test();
             let addr = next_addr();
 
             let mut config = TcpConfig::from_address(addr.into());
-            config.set_max_length(None);
             config.set_framing(Some(
                 NewlineDelimitedDecoderConfig::new_with_max_length(10).into(),
             ));
@@ -547,11 +583,14 @@ mod test {
             send_lines(addr, lines.into_iter()).await.unwrap();
 
             let event = rx.next().await.unwrap();
-            assert_eq!(event.as_log()[log_schema().message_key()], "short".into());
+            assert_eq!(
+                event.as_log()[log_schema().message_key().unwrap().to_string()],
+                "short".into()
+            );
 
             let event = rx.next().await.unwrap();
             assert_eq!(
-                event.as_log()[log_schema().message_key()],
+                event.as_log()[log_schema().message_key().unwrap().to_string()],
                 "more short".into()
             );
         })
@@ -560,7 +599,7 @@ mod test {
 
     #[tokio::test]
     async fn tcp_with_tls() {
-        assert_source_compliance(&SOCKET_HIGH_CARDINALITY_PUSH_SOURCE_TAGS, async {
+        assert_source_compliance(&SOCKET_PUSH_SOURCE_TAGS, async {
             let (tx, mut rx) = SourceSender::new_test();
             let addr = next_addr();
 
@@ -601,11 +640,11 @@ mod test {
 
             let event = rx.next().await.unwrap();
             assert_eq!(
-                event.as_log()[log_schema().message_key()],
+                event.as_log()[log_schema().message_key().unwrap().to_string()],
                 "one line".into()
             );
 
-            let tls_meta: BTreeMap<String, value::Value> = btreemap!(
+            let tls_meta: ObjectMap = btreemap!(
                 "subject" => "CN=localhost,OU=Vector,O=Datadog,L=New York,ST=New York,C=US"
             );
 
@@ -613,7 +652,7 @@ mod test {
 
             let event = rx.next().await.unwrap();
             assert_eq!(
-                event.as_log()[log_schema().message_key()],
+                event.as_log()[log_schema().message_key().unwrap().to_string()],
                 "another line".into()
             );
 
@@ -624,7 +663,7 @@ mod test {
 
     #[tokio::test]
     async fn tcp_with_tls_vector_namespace() {
-        assert_source_compliance(&SOCKET_HIGH_CARDINALITY_PUSH_SOURCE_TAGS, async {
+        assert_source_compliance(&SOCKET_PUSH_SOURCE_TAGS, async {
             let (tx, mut rx) = SourceSender::new_test();
             let addr = next_addr();
 
@@ -670,7 +709,7 @@ mod test {
 
             assert_eq!(log.value(), &"one line".into());
 
-            let tls_meta: BTreeMap<String, value::Value> = btreemap!(
+            let tls_meta: ObjectMap = btreemap!(
                 "subject" => "CN=localhost,OU=Vector,O=Datadog,L=New York,ST=New York,C=US"
             );
 
@@ -678,7 +717,7 @@ mod test {
                 event_meta
                     .get(path!(SocketConfig::NAME, "tls_client_metadata"))
                     .unwrap(),
-                &vrl::value!(tls_meta.clone())
+                &value!(tls_meta.clone())
             );
 
             let event = rx.next().await.unwrap();
@@ -691,7 +730,7 @@ mod test {
                 event_meta
                     .get(path!(SocketConfig::NAME, "tls_client_metadata"))
                     .unwrap(),
-                &vrl::value!(tls_meta.clone())
+                &value!(tls_meta.clone())
             );
         })
         .await;
@@ -699,7 +738,7 @@ mod test {
 
     #[tokio::test]
     async fn tcp_shutdown_simple() {
-        assert_source_compliance(&SOCKET_HIGH_CARDINALITY_PUSH_SOURCE_TAGS, async {
+        assert_source_compliance(&SOCKET_PUSH_SOURCE_TAGS, async {
             let source_id = ComponentKey::from("tcp_shutdown_simple");
             let (tx, mut rx) = SourceSender::new_test();
             let addr = next_addr();
@@ -719,7 +758,10 @@ mod test {
                 .unwrap();
 
             let event = rx.next().await.unwrap();
-            assert_eq!(event.as_log()[log_schema().message_key()], "test".into());
+            assert_eq!(
+                event.as_log()[log_schema().message_key().unwrap().to_string()],
+                "test".into()
+            );
 
             // Now signal to the Source to shut down.
             let deadline = Instant::now() + Duration::from_secs(10);
@@ -728,7 +770,7 @@ mod test {
             assert!(shutdown_success);
 
             // Ensure source actually shut down successfully.
-            let _ = source_handle.await.unwrap();
+            _ = source_handle.await.unwrap();
         })
         .await;
     }
@@ -743,7 +785,7 @@ mod test {
         // shutdown.
         let addr = next_addr();
 
-        let (source_tx, source_rx) = SourceSender::new_with_buffer(10_000);
+        let (source_tx, source_rx) = SourceSender::new_test_sender_with_buffer(10_000);
         let source_key = ComponentKey::from("tcp_shutdown_infinite_stream");
         let (source_cx, mut shutdown) = SourceContext::new_shutdown(&source_key, source_tx);
 
@@ -769,7 +811,7 @@ mod test {
             bytes: Bytes,
         }
         impl tokio_util::codec::Encoder<Event> for Serializer {
-            type Error = codecs::encoding::Error;
+            type Error = vector_lib::codecs::encoding::Error;
 
             fn encode(&mut self, _: Event, buffer: &mut BytesMut) -> Result<(), Self::Error> {
                 buffer.put(self.bytes.as_ref());
@@ -797,10 +839,10 @@ mod test {
             .collect::<Vec<_>>();
         assert_eq!(100, events.len());
 
-        let message_key = log_schema().message_key();
+        let message_key = log_schema().message_key().unwrap().to_string();
         let expected_message = message.clone().into();
         for event in events.into_iter().flat_map(EventContainer::into_events) {
-            assert_eq!(event.as_log()[message_key], expected_message);
+            assert_eq!(event.as_log()[message_key.as_str()], expected_message);
         }
 
         // Now trigger shutdown on the source and ensure that it shuts down before or at the
@@ -857,20 +899,24 @@ mod test {
 
     //////// UDP TESTS ////////
     fn send_lines_udp(addr: SocketAddr, lines: impl IntoIterator<Item = String>) -> SocketAddr {
+        send_packets_udp(addr, lines.into_iter().map(|line| line.into()))
+    }
+
+    fn send_packets_udp(addr: SocketAddr, packets: impl IntoIterator<Item = Bytes>) -> SocketAddr {
         let bind = next_addr();
         let socket = UdpSocket::bind(bind)
             .map_err(|error| panic!("{:}", error))
             .ok()
             .unwrap();
 
-        for line in lines {
+        for packet in packets {
             assert_eq!(
                 socket
-                    .send_to(line.as_bytes(), addr)
+                    .send_to(&packet, addr)
                     .map_err(|error| panic!("{:}", error))
                     .ok()
                     .unwrap(),
-                line.as_bytes().len()
+                packet.len()
             );
             // Space things out slightly to try to avoid dropped packets
             thread::sleep(Duration::from_millis(1));
@@ -888,7 +934,7 @@ mod test {
         source_id: &ComponentKey,
         shutdown: &mut SourceShutdownCoordinator,
     ) -> (SocketAddr, JoinHandle<Result<(), ()>>) {
-        let (shutdown_signal, _) = shutdown.register_source(source_id);
+        let (shutdown_signal, _) = shutdown.register_source(source_id, false);
         init_udp_inner(sender, source_id, shutdown_signal, None, false).await
     }
 
@@ -951,6 +997,7 @@ mod test {
                 acknowledgements: false,
                 schema: Default::default(),
                 schema_definitions: HashMap::default(),
+                extra_context: Default::default(),
             })
             .await
             .unwrap();
@@ -964,7 +1011,7 @@ mod test {
 
     #[tokio::test]
     async fn udp_message() {
-        assert_source_compliance(&SOCKET_HIGH_CARDINALITY_PUSH_SOURCE_TAGS, async {
+        assert_source_compliance(&SOCKET_PUSH_SOURCE_TAGS, async {
             let (tx, rx) = SourceSender::new_test();
             let address = init_udp(tx, false).await;
 
@@ -972,7 +1019,7 @@ mod test {
             let events = collect_n(rx, 1).await;
 
             assert_eq!(
-                events[0].as_log()[log_schema().message_key()],
+                events[0].as_log()[log_schema().message_key().unwrap().to_string()],
                 "test".into()
             );
         })
@@ -981,7 +1028,7 @@ mod test {
 
     #[tokio::test]
     async fn udp_message_preserves_newline() {
-        assert_source_compliance(&SOCKET_HIGH_CARDINALITY_PUSH_SOURCE_TAGS, async {
+        assert_source_compliance(&SOCKET_PUSH_SOURCE_TAGS, async {
             let (tx, rx) = SourceSender::new_test();
             let address = init_udp(tx, false).await;
 
@@ -989,7 +1036,7 @@ mod test {
             let events = collect_n(rx, 1).await;
 
             assert_eq!(
-                events[0].as_log()[log_schema().message_key()],
+                events[0].as_log()[log_schema().message_key().unwrap().to_string()],
                 "foo\nbar".into()
             );
         })
@@ -998,7 +1045,7 @@ mod test {
 
     #[tokio::test]
     async fn udp_multiple_packets() {
-        assert_source_compliance(&SOCKET_HIGH_CARDINALITY_PUSH_SOURCE_TAGS, async {
+        assert_source_compliance(&SOCKET_PUSH_SOURCE_TAGS, async {
             let (tx, rx) = SourceSender::new_test();
             let address = init_udp(tx, false).await;
 
@@ -1006,11 +1053,11 @@ mod test {
             let events = collect_n(rx, 2).await;
 
             assert_eq!(
-                events[0].as_log()[log_schema().message_key()],
+                events[0].as_log()[log_schema().message_key().unwrap().to_string()],
                 "test".into()
             );
             assert_eq!(
-                events[1].as_log()[log_schema().message_key()],
+                events[1].as_log()[log_schema().message_key().unwrap().to_string()],
                 "test2".into()
             );
         })
@@ -1019,11 +1066,11 @@ mod test {
 
     #[tokio::test]
     async fn udp_max_length() {
-        assert_source_compliance(&SOCKET_HIGH_CARDINALITY_PUSH_SOURCE_TAGS, async {
+        assert_source_compliance(&SOCKET_PUSH_SOURCE_TAGS, async {
             let (tx, rx) = SourceSender::new_test();
             let address = next_addr();
             let mut config = UdpConfig::from_address(address.into());
-            config.max_length = Some(11);
+            config.max_length = 11;
             let address = init_udp_with_config(tx, config).await;
 
             send_lines_udp(
@@ -1037,11 +1084,11 @@ mod test {
 
             let events = collect_n(rx, 2).await;
             assert_eq!(
-                events[0].as_log()[log_schema().message_key()],
+                events[0].as_log()[log_schema().message_key().unwrap().to_string()],
                 "short line".into()
             );
             assert_eq!(
-                events[1].as_log()[log_schema().message_key()],
+                events[1].as_log()[log_schema().message_key().unwrap().to_string()],
                 "a short un".into()
             );
         })
@@ -1055,15 +1102,17 @@ mod test {
     /// Windows will drop the entire packet if we exceed the max_length so we are unable to
     /// extract anything.
     async fn udp_max_length_delimited() {
-        assert_source_compliance(&SOCKET_HIGH_CARDINALITY_PUSH_SOURCE_TAGS, async {
+        assert_source_compliance(&SOCKET_PUSH_SOURCE_TAGS, async {
             let (tx, rx) = SourceSender::new_test();
             let address = next_addr();
             let mut config = UdpConfig::from_address(address.into());
-            config.max_length = Some(10);
-            config.framing = CharacterDelimitedDecoderConfig {
-                character_delimited: CharacterDelimitedDecoderOptions::new(b',', None),
-            }
-            .into();
+            config.max_length = 10;
+            config.framing = Some(
+                CharacterDelimitedDecoderConfig {
+                    character_delimited: CharacterDelimitedDecoderOptions::new(b',', None),
+                }
+                .into(),
+            );
             let address = init_udp_with_config(tx, config).await;
 
             send_lines_udp(
@@ -1073,11 +1122,11 @@ mod test {
 
             let events = collect_n(rx, 2).await;
             assert_eq!(
-                events[0].as_log()[log_schema().message_key()],
+                events[0].as_log()[log_schema().message_key().unwrap().to_string()],
                 "test with".into()
             );
             assert_eq!(
-                events[1].as_log()[log_schema().message_key()],
+                events[1].as_log()[log_schema().message_key().unwrap().to_string()],
                 "short one".into()
             );
         })
@@ -1085,8 +1134,42 @@ mod test {
     }
 
     #[tokio::test]
+    async fn udp_decodes_chunked_gelf_messages() {
+        assert_source_compliance(&SOCKET_PUSH_SOURCE_TAGS, async {
+            let (tx, rx) = SourceSender::new_test();
+            let address = next_addr();
+            let mut config = UdpConfig::from_address(address.into());
+            config.decoding = GelfDeserializerConfig::default().into();
+            let address = init_udp_with_config(tx, config).await;
+            let seed = 42;
+            let mut rng = SmallRng::seed_from_u64(seed);
+            let max_size = 300;
+            let big_message = "This is a very large message".repeat(500);
+            let another_big_message = "This is another very large message".repeat(500);
+            let mut chunks = get_gelf_chunks(big_message.as_str(), max_size, &mut rng);
+            let mut another_chunks =
+                get_gelf_chunks(another_big_message.as_str(), max_size, &mut rng);
+            chunks.append(&mut another_chunks);
+            chunks.shuffle(&mut rng);
+
+            send_packets_udp(address, chunks);
+
+            let events = collect_n(rx, 2).await;
+            assert_eq!(
+                events[1].as_log()[log_schema().message_key().unwrap().to_string()],
+                big_message.into()
+            );
+            assert_eq!(
+                events[0].as_log()[log_schema().message_key().unwrap().to_string()],
+                another_big_message.into()
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test]
     async fn udp_it_includes_host() {
-        assert_source_compliance(&SOCKET_HIGH_CARDINALITY_PUSH_SOURCE_TAGS, async {
+        assert_source_compliance(&SOCKET_PUSH_SOURCE_TAGS, async {
             let (tx, rx) = SourceSender::new_test();
             let address = init_udp(tx, false).await;
 
@@ -1101,7 +1184,7 @@ mod test {
 
     #[tokio::test]
     async fn udp_it_includes_vector_namespaced_fields() {
-        assert_source_compliance(&SOCKET_HIGH_CARDINALITY_PUSH_SOURCE_TAGS, async {
+        assert_source_compliance(&SOCKET_PUSH_SOURCE_TAGS, async {
             let (tx, rx) = SourceSender::new_test();
             let address = init_udp(tx, true).await;
 
@@ -1113,15 +1196,15 @@ mod test {
             assert_eq!(log.value(), &"test".into());
             assert_eq!(
                 event_meta.get(path!("vector", "source_type")).unwrap(),
-                &vrl::value!(SocketConfig::NAME)
+                &value!(SocketConfig::NAME)
             );
             assert_eq!(
                 event_meta.get(path!(SocketConfig::NAME, "host")).unwrap(),
-                &vrl::value!(from.ip().to_string())
+                &value!(from.ip().to_string())
             );
             assert_eq!(
                 event_meta.get(path!(SocketConfig::NAME, "port")).unwrap(),
-                &vrl::value!(from.port())
+                &value!(from.port())
             );
         })
         .await;
@@ -1129,15 +1212,15 @@ mod test {
 
     #[tokio::test]
     async fn udp_it_includes_source_type() {
-        assert_source_compliance(&SOCKET_HIGH_CARDINALITY_PUSH_SOURCE_TAGS, async {
+        assert_source_compliance(&SOCKET_PUSH_SOURCE_TAGS, async {
             let (tx, rx) = SourceSender::new_test();
             let address = init_udp(tx, false).await;
 
-            let _ = send_lines_udp(address, vec!["test".to_string()]);
+            _ = send_lines_udp(address, vec!["test".to_string()]);
             let events = collect_n(rx, 1).await;
 
             assert_eq!(
-                events[0].as_log()[log_schema().source_type_key()],
+                events[0].as_log()[log_schema().source_type_key().unwrap().to_string()],
                 "socket".into()
             );
         })
@@ -1146,7 +1229,7 @@ mod test {
 
     #[tokio::test]
     async fn udp_shutdown_simple() {
-        assert_source_compliance(&SOCKET_HIGH_CARDINALITY_PUSH_SOURCE_TAGS, async {
+        assert_source_compliance(&SOCKET_PUSH_SOURCE_TAGS, async {
             let (tx, rx) = SourceSender::new_test();
             let source_id = ComponentKey::from("udp_shutdown_simple");
 
@@ -1158,7 +1241,7 @@ mod test {
             let events = collect_n(rx, 1).await;
 
             assert_eq!(
-                events[0].as_log()[log_schema().message_key()],
+                events[0].as_log()[log_schema().message_key().unwrap().to_string()],
                 "test".into()
             );
 
@@ -1169,14 +1252,14 @@ mod test {
             assert!(shutdown_success);
 
             // Ensure source actually shut down successfully.
-            let _ = source_handle.await.unwrap();
+            _ = source_handle.await.unwrap();
         })
         .await;
     }
 
     #[tokio::test]
     async fn udp_shutdown_infinite_stream() {
-        assert_source_compliance(&SOCKET_HIGH_CARDINALITY_PUSH_SOURCE_TAGS, async {
+        assert_source_compliance(&SOCKET_PUSH_SOURCE_TAGS, async {
             let (tx, rx) = SourceSender::new_test();
             let source_id = ComponentKey::from("udp_shutdown_infinite_stream");
 
@@ -1199,7 +1282,10 @@ mod test {
             let events = collect_n(rx, 100).await;
             assert_eq!(100, events.len());
             for event in events {
-                assert_eq!(event.as_log()[log_schema().message_key()], "test".into());
+                assert_eq!(
+                    event.as_log()[log_schema().message_key().unwrap().to_string()],
+                    "test".into()
+                );
             }
 
             let deadline = Instant::now() + Duration::from_secs(10);
@@ -1208,7 +1294,7 @@ mod test {
             assert!(shutdown_success);
 
             // Ensure that the source has actually shut down.
-            let _ = source_handle.await.unwrap();
+            _ = source_handle.await.unwrap();
 
             // Stop the pump from sending lines forever.
             run_pump_atomic_sender.store(false, Ordering::Relaxed);
@@ -1218,11 +1304,35 @@ mod test {
     }
 
     ////////////// UNIX TEST LIBS //////////////
+
     #[cfg(unix)]
     async fn init_unix(sender: SourceSender, stream: bool, use_vector_namespace: bool) -> PathBuf {
-        let in_path = tempfile::tempdir().unwrap().into_path().join("unix_test");
+        init_unix_inner(sender, stream, use_vector_namespace, None).await
+    }
 
-        let mut config = UnixConfig::new(in_path.clone());
+    #[cfg(unix)]
+    async fn init_unix_with_config(
+        sender: SourceSender,
+        stream: bool,
+        use_vector_namespace: bool,
+        config: UnixConfig,
+    ) -> PathBuf {
+        init_unix_inner(sender, stream, use_vector_namespace, Some(config)).await
+    }
+
+    #[cfg(unix)]
+    async fn init_unix_inner(
+        sender: SourceSender,
+        stream: bool,
+        use_vector_namespace: bool,
+        config: Option<UnixConfig>,
+    ) -> PathBuf {
+        let mut config = config.unwrap_or_else(|| {
+            UnixConfig::new(tempfile::tempdir().unwrap().into_path().join("unix_test"))
+        });
+
+        let in_path = config.path.clone();
+
         if use_vector_namespace {
             config.log_namespace = Some(true);
         }
@@ -1232,6 +1342,7 @@ mod test {
         } else {
             Mode::UnixDatagram(config)
         };
+
         let server = SocketConfig { mode }
             .build(SourceContext::new_test(sender, None))
             .await
@@ -1284,11 +1395,11 @@ mod test {
 
         assert_eq!(2, events.len());
         assert_eq!(
-            events[0].as_log()[log_schema().message_key()],
+            events[0].as_log()[log_schema().message_key().unwrap().to_string()],
             "test".into()
         );
         assert_eq!(
-            events[1].as_log()[log_schema().message_key()],
+            events[1].as_log()[log_schema().message_key().unwrap().to_string()],
             "test2".into()
         );
     }
@@ -1321,11 +1432,17 @@ mod test {
     ////////////// UNIX DATAGRAM TESTS //////////////
     #[cfg(unix)]
     async fn send_lines_unix_datagram(path: PathBuf, lines: &[&str]) {
+        let packets = lines.iter().map(|line| Bytes::from(line.to_string()));
+        send_packets_unix_datagram(path, packets).await;
+    }
+
+    #[cfg(unix)]
+    async fn send_packets_unix_datagram(path: PathBuf, packets: impl IntoIterator<Item = Bytes>) {
         let socket = UnixDatagram::unbound().unwrap();
         socket.connect(path).unwrap();
 
-        for line in lines {
-            socket.send(line.as_bytes()).await.unwrap();
+        for packet in packets {
+            socket.send(&packet).await.unwrap();
         }
         socket.shutdown(std::net::Shutdown::Both).unwrap();
     }
@@ -1333,17 +1450,17 @@ mod test {
     #[cfg(unix)]
     #[tokio::test]
     async fn unix_datagram_message() {
-        assert_source_compliance(&SOCKET_HIGH_CARDINALITY_PUSH_SOURCE_TAGS, async {
+        assert_source_compliance(&SOCKET_PUSH_SOURCE_TAGS, async {
             let (_, rx) = unix_message("test", false, false).await;
             let events = collect_n(rx, 1).await;
 
             assert_eq!(events.len(), 1);
             assert_eq!(
-                events[0].as_log()[log_schema().message_key()],
+                events[0].as_log()[log_schema().message_key().unwrap().to_string()],
                 "test".into()
             );
             assert_eq!(
-                events[0].as_log()[log_schema().source_type_key()],
+                events[0].as_log()[log_schema().source_type_key().unwrap().to_string()],
                 "socket".into()
             );
             assert_eq!(events[0].as_log()["host"], UNNAMED_SOCKET_HOST.into());
@@ -1399,8 +1516,43 @@ mod test {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn unix_datagram_chunked_gelf_messages() {
+        assert_source_compliance(&SOCKET_PUSH_SOURCE_TAGS, async {
+            let (tx, rx) = SourceSender::new_test();
+            let in_path = tempfile::tempdir().unwrap().into_path().join("unix_test");
+            let mut config = UnixConfig::new(in_path.clone());
+            config.decoding = GelfDeserializerConfig::default().into();
+            let path = init_unix_with_config(tx, false, false, config).await;
+            let seed = 42;
+            let mut rng = SmallRng::seed_from_u64(seed);
+            let max_size = 20;
+            let big_message = "This is a very large message".repeat(5);
+            let another_big_message = "This is another very large message".repeat(5);
+            let mut chunks = get_gelf_chunks(big_message.as_str(), max_size, &mut rng);
+            let mut another_chunks =
+                get_gelf_chunks(another_big_message.as_str(), max_size, &mut rng);
+            chunks.append(&mut another_chunks);
+            chunks.shuffle(&mut rng);
+
+            send_packets_unix_datagram(path, chunks).await;
+
+            let events = collect_n(rx, 2).await;
+            assert_eq!(
+                events[1].as_log()[log_schema().message_key().unwrap().to_string()],
+                big_message.into()
+            );
+            assert_eq!(
+                events[0].as_log()[log_schema().message_key().unwrap().to_string()],
+                another_big_message.into()
+            );
+        })
+        .await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn unix_datagram_message_with_vector_namespace() {
-        assert_source_compliance(&SOCKET_HIGH_CARDINALITY_PUSH_SOURCE_TAGS, async {
+        assert_source_compliance(&SOCKET_PUSH_SOURCE_TAGS, async {
             let (_, rx) = unix_message("test", false, true).await;
             let events = collect_n(rx, 1).await;
             let log = events[0].as_log();
@@ -1411,12 +1563,12 @@ mod test {
 
             assert_eq!(
                 event_meta.get(path!("vector", "source_type")).unwrap(),
-                &vrl::value!(SocketConfig::NAME)
+                &value!(SocketConfig::NAME)
             );
 
             assert_eq!(
                 event_meta.get(path!(SocketConfig::NAME, "host")).unwrap(),
-                &vrl::value!(UNNAMED_SOCKET_HOST)
+                &value!(UNNAMED_SOCKET_HOST)
             );
         })
         .await;
@@ -1425,17 +1577,17 @@ mod test {
     #[cfg(unix)]
     #[tokio::test]
     async fn unix_datagram_message_preserves_newline() {
-        assert_source_compliance(&SOCKET_HIGH_CARDINALITY_PUSH_SOURCE_TAGS, async {
+        assert_source_compliance(&SOCKET_PUSH_SOURCE_TAGS, async {
             let (_, rx) = unix_message("foo\nbar", false, false).await;
             let events = collect_n(rx, 1).await;
 
             assert_eq!(events.len(), 1);
             assert_eq!(
-                events[0].as_log()[log_schema().message_key()],
+                events[0].as_log()[log_schema().message_key().unwrap().to_string()],
                 "foo\nbar".into()
             );
             assert_eq!(
-                events[0].as_log()[log_schema().source_type_key()],
+                events[0].as_log()[log_schema().source_type_key().unwrap().to_string()],
                 "socket".into()
             );
         })
@@ -1445,7 +1597,7 @@ mod test {
     #[cfg(unix)]
     #[tokio::test]
     async fn unix_datagram_multiple_packets() {
-        assert_source_compliance(&SOCKET_HIGH_CARDINALITY_PUSH_SOURCE_TAGS, async {
+        assert_source_compliance(&SOCKET_PUSH_SOURCE_TAGS, async {
             unix_multiple_packets(false).await
         })
         .await;
@@ -1512,17 +1664,17 @@ mod test {
     #[cfg(unix)]
     #[tokio::test]
     async fn unix_stream_message() {
-        assert_source_compliance(&SOCKET_HIGH_CARDINALITY_PUSH_SOURCE_TAGS, async {
+        assert_source_compliance(&SOCKET_PUSH_SOURCE_TAGS, async {
             let (_, rx) = unix_message("test", true, false).await;
             let events = collect_n(rx, 1).await;
 
             assert_eq!(1, events.len());
             assert_eq!(
-                events[0].as_log()[log_schema().message_key()],
+                events[0].as_log()[log_schema().message_key().unwrap().to_string()],
                 "test".into()
             );
             assert_eq!(
-                events[0].as_log()[log_schema().source_type_key()],
+                events[0].as_log()[log_schema().source_type_key().unwrap().to_string()],
                 "socket".into()
             );
         })
@@ -1532,7 +1684,7 @@ mod test {
     #[cfg(unix)]
     #[tokio::test]
     async fn unix_stream_message_with_vector_namespace() {
-        assert_source_compliance(&SOCKET_HIGH_CARDINALITY_PUSH_SOURCE_TAGS, async {
+        assert_source_compliance(&SOCKET_PUSH_SOURCE_TAGS, async {
             let (_, rx) = unix_message("test", true, true).await;
             let events = collect_n(rx, 1).await;
             let log = events[0].as_log();
@@ -1542,11 +1694,11 @@ mod test {
             assert_eq!(1, events.len());
             assert_eq!(
                 event_meta.get(path!("vector", "source_type")).unwrap(),
-                &vrl::value!(SocketConfig::NAME)
+                &value!(SocketConfig::NAME)
             );
             assert_eq!(
                 event_meta.get(path!(SocketConfig::NAME, "host")).unwrap(),
-                &vrl::value!(UNNAMED_SOCKET_HOST)
+                &value!(UNNAMED_SOCKET_HOST)
             );
         })
         .await;
@@ -1555,19 +1707,25 @@ mod test {
     #[cfg(unix)]
     #[tokio::test]
     async fn unix_stream_message_splits_on_newline() {
-        assert_source_compliance(&SOCKET_HIGH_CARDINALITY_PUSH_SOURCE_TAGS, async {
+        assert_source_compliance(&SOCKET_PUSH_SOURCE_TAGS, async {
             let (_, rx) = unix_message("foo\nbar", true, false).await;
             let events = collect_n(rx, 2).await;
 
             assert_eq!(events.len(), 2);
-            assert_eq!(events[0].as_log()[log_schema().message_key()], "foo".into());
             assert_eq!(
-                events[0].as_log()[log_schema().source_type_key()],
+                events[0].as_log()[log_schema().message_key().unwrap().to_string()],
+                "foo".into()
+            );
+            assert_eq!(
+                events[0].as_log()[log_schema().source_type_key().unwrap().to_string()],
                 "socket".into()
             );
-            assert_eq!(events[1].as_log()[log_schema().message_key()], "bar".into());
             assert_eq!(
-                events[1].as_log()[log_schema().source_type_key()],
+                events[1].as_log()[log_schema().message_key().unwrap().to_string()],
+                "bar".into()
+            );
+            assert_eq!(
+                events[1].as_log()[log_schema().source_type_key().unwrap().to_string()],
                 "socket".into()
             );
         })
@@ -1577,7 +1735,7 @@ mod test {
     #[cfg(unix)]
     #[tokio::test]
     async fn unix_stream_multiple_packets() {
-        assert_source_compliance(&SOCKET_HIGH_CARDINALITY_PUSH_SOURCE_TAGS, async {
+        assert_source_compliance(&SOCKET_PUSH_SOURCE_TAGS, async {
             unix_multiple_packets(true).await
         })
         .await;

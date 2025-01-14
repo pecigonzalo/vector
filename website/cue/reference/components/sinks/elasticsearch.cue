@@ -91,6 +91,9 @@ components: sinks: elasticsearch: {
 				inserted via the `index` action, which replaces documents if an existing
 				one has the same `id`. If `bulk.action` is configured with `create`, Elasticsearch
 				does _not_ replace an existing document and instead returns a conflict error.
+				When `bulk.action` is set to `update`, the document is updated with several constraints.
+				The message must be added in `.doc` and have `.doc_as_upsert` to true.
+				The `update` operation requires the `id_key` to be set, and the `encoding` field should specify `doc` and `doc_as_upsert` as values.
 				"""
 		}
 
@@ -133,14 +136,5 @@ components: sinks: elasticsearch: {
 		}
 
 		aws_authentication: components._aws.how_it_works.aws_authentication
-	}
-
-	telemetry: metrics: {
-		component_sent_bytes_total:       components.sources.internal_metrics.output.metrics.component_sent_bytes_total
-		component_sent_events_total:      components.sources.internal_metrics.output.metrics.component_sent_events_total
-		component_sent_event_bytes_total: components.sources.internal_metrics.output.metrics.component_sent_event_bytes_total
-		events_discarded_total:           components.sources.internal_metrics.output.metrics.events_discarded_total
-		events_out_total:                 components.sources.internal_metrics.output.metrics.events_out_total
-		processing_errors_total:          components.sources.internal_metrics.output.metrics.processing_errors_total
 	}
 }

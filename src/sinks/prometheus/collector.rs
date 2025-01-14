@@ -2,8 +2,8 @@ use std::{collections::BTreeMap, fmt::Write as _};
 
 use chrono::Utc;
 use indexmap::map::IndexMap;
-use prometheus_parser::{proto, METRIC_NAME_LABEL};
-use vector_core::event::metric::{samples_to_buckets, MetricSketch, MetricTags, Quantile};
+use vector_lib::event::metric::{samples_to_buckets, MetricSketch, MetricTags, Quantile};
+use vector_lib::prometheus::parser::{proto, METRIC_NAME_LABEL};
 
 use crate::{
     event::metric::{Metric, MetricKind, MetricValue, StatisticKind},
@@ -255,7 +255,7 @@ impl MetricCollector for StringCollector {
         result.push_str(name);
         result.push_str(suffix);
         Self::encode_tags(result, tags, extra);
-        let _ = match timestamp_millis {
+        _ = match timestamp_millis {
             None => writeln!(result, " {}", value),
             Some(timestamp) => writeln!(result, " {} {}", value, timestamp),
         };
@@ -301,7 +301,7 @@ impl StringCollector {
         let mut result = String::with_capacity(key.len() + value.len() + 3);
         result.push_str(key);
         result.push_str("=\"");
-        while let Some(i) = value.find(|ch| ch == '\\' || ch == '"') {
+        while let Some(i) = value.find(['\\', '"']) {
             result.push_str(&value[..i]);
             result.push('\\');
             // Ugly but works because we know the character at `i` is ASCII
@@ -437,10 +437,10 @@ const fn prometheus_metric_type(metric_value: &MetricValue) -> proto::MetricType
 mod tests {
     use std::collections::BTreeSet;
 
-    use chrono::{DateTime, TimeZone};
+    use chrono::{DateTime, TimeZone, Timelike};
     use indoc::indoc;
     use similar_asserts::assert_eq;
-    use vector_core::metric_tags;
+    use vector_lib::metric_tags;
 
     use super::{super::default_summary_quantiles, *};
     use crate::{
@@ -569,11 +569,11 @@ mod tests {
     fn encodes_set_text() {
         assert_eq!(
             encode_set::<StringCollector>(),
-            indoc! { r#"
+            indoc! { r"
                 # HELP vector_users users
                 # TYPE vector_users gauge
                 vector_users 1 1612325106789
-            "#}
+            "}
         );
     }
 
@@ -601,11 +601,11 @@ mod tests {
     fn encodes_expired_set_text() {
         assert_eq!(
             encode_expired_set::<StringCollector>(),
-            indoc! {r#"
+            indoc! {r"
                 # HELP vector_users users
                 # TYPE vector_users gauge
                 vector_users 0 1612325106789
-            "#}
+            "}
         );
     }
 
@@ -668,7 +668,7 @@ mod tests {
             "requests".to_owned(),
             MetricKind::Absolute,
             MetricValue::Distribution {
-                samples: vector_core::samples![1.0 => 3, 2.0 => 3, 3.0 => 2],
+                samples: vector_lib::samples![1.0 => 3, 2.0 => 3, 3.0 => 2],
                 statistic: StatisticKind::Histogram,
             },
         )
@@ -803,7 +803,7 @@ mod tests {
             "requests".to_owned(),
             MetricKind::Absolute,
             MetricValue::AggregatedSummary {
-                quantiles: vector_core::quantiles![0.01 => 1.5, 0.5 => 2.0, 0.99 => 3.0],
+                quantiles: vector_lib::quantiles![0.01 => 1.5, 0.5 => 2.0, 0.99 => 3.0],
                 count: 6,
                 sum: 12.0,
             },
@@ -860,7 +860,7 @@ mod tests {
             "requests".to_owned(),
             MetricKind::Absolute,
             MetricValue::Distribution {
-                samples: vector_core::samples![1.0 => 3, 2.0 => 3, 3.0 => 2],
+                samples: vector_lib::samples![1.0 => 3, 2.0 => 3, 3.0 => 2],
                 statistic: StatisticKind::Summary,
             },
         )
@@ -873,11 +873,11 @@ mod tests {
     fn encodes_timestamp_text() {
         assert_eq!(
             encode_timestamp::<StringCollector>(),
-            indoc! {r#"
+            indoc! {r"
                 # HELP temperature temperature
                 # TYPE temperature counter
                 temperature 2 1612325106789
-            "#}
+            "}
         );
     }
 
@@ -912,7 +912,10 @@ mod tests {
     }
 
     fn timestamp() -> DateTime<Utc> {
-        Utc.ymd(2021, 2, 3).and_hms_milli(4, 5, 6, 789)
+        Utc.with_ymd_and_hms(2021, 2, 3, 4, 5, 6)
+            .single()
+            .and_then(|t| t.with_nanosecond(789 * 1_000_000))
+            .expect("invalid timestamp")
     }
 
     #[test]
@@ -920,7 +923,7 @@ mod tests {
         let tags = metric_tags!(
             "code" => "200",
             "quoted" => r#"host"1""#,
-            "path" => r#"c:\Windows"#,
+            "path" => r"c:\Windows",
         );
         let metric = Metric::new(
             "something".to_owned(),
@@ -940,9 +943,11 @@ mod tests {
     }
 
     /// According to the [spec](https://github.com/OpenObservability/OpenMetrics/blob/main/specification/OpenMetrics.md?plain=1#L115)
+    ///
     /// > Label names MUST be unique within a LabelSet.
-    /// Prometheus itself will reject the metric with an error. Largely to remain backward compatible with older versions of Vector,
-    /// we only publish the last tag in the list.
+    ///
+    /// Prometheus itself will reject the metric with an error. Largely to remain backward
+    /// compatible with older versions of Vector, we only publish the last tag in the list.
     #[test]
     fn encodes_duplicate_tags() {
         let tags = metric_tags!(

@@ -2,13 +2,13 @@ use bytes::Bytes;
 use prost::Message;
 use serde::{Deserialize, Serialize};
 use smallvec::{smallvec, SmallVec};
-use value::Kind;
 use vector_core::config::LogNamespace;
 use vector_core::{
     config::DataType,
     event::{proto, Event, EventArray, EventContainer},
     schema,
 };
+use vrl::value::Kind;
 
 use super::Deserializer;
 
@@ -19,12 +19,12 @@ pub struct NativeDeserializerConfig;
 impl NativeDeserializerConfig {
     /// Build the `NativeDeserializer` from this configuration.
     pub fn build(&self) -> NativeDeserializer {
-        NativeDeserializer::default()
+        NativeDeserializer
     }
 
     /// Return the type of event build by this deserializer.
     pub fn output_type(&self) -> DataType {
-        DataType::all()
+        DataType::all_bits()
     }
 
     /// The schema produced by the deserializer.

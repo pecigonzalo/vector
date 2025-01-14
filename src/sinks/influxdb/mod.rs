@@ -9,9 +9,9 @@ use futures::FutureExt;
 use http::{StatusCode, Uri};
 use snafu::{ResultExt, Snafu};
 use tower::Service;
-use vector_common::sensitive_string::SensitiveString;
-use vector_config::configurable_component;
-use vector_core::event::MetricTags;
+use vector_lib::configurable::configurable_component;
+use vector_lib::event::{KeyString, MetricTags};
+use vector_lib::sensitive_string::SensitiveString;
 
 use crate::http::HttpClient;
 
@@ -232,7 +232,7 @@ pub(in crate::sinks) fn influx_line_protocol(
     protocol_version: ProtocolVersion,
     measurement: &str,
     tags: Option<MetricTags>,
-    fields: Option<HashMap<String, Field>>,
+    fields: Option<HashMap<KeyString, Field>>,
     timestamp: i64,
     line_protocol: &mut BytesMut,
 ) -> Result<(), &'static str> {
@@ -244,11 +244,13 @@ pub(in crate::sinks) fn influx_line_protocol(
     }
 
     encode_string(measurement, line_protocol);
-    line_protocol.put_u8(b',');
 
-    // Tags
+    // Tags are optional
     let unwrapped_tags = tags.unwrap_or_default();
-    encode_tags(unwrapped_tags, line_protocol);
+    if !unwrapped_tags.is_empty() {
+        line_protocol.put_u8(b',');
+        encode_tags(unwrapped_tags, line_protocol);
+    }
     line_protocol.put_u8(b' ');
 
     // Fields
@@ -282,7 +284,7 @@ fn encode_tags(tags: MetricTags, output: &mut BytesMut) {
 
 fn encode_fields(
     protocol_version: ProtocolVersion,
-    fields: HashMap<String, Field>,
+    fields: HashMap<KeyString, Field>,
     output: &mut BytesMut,
 ) {
     let original_len = output.len();
@@ -340,7 +342,7 @@ fn encode_string(key: &str, output: &mut BytesMut) {
 
 pub(in crate::sinks) fn encode_timestamp(timestamp: Option<DateTime<Utc>>) -> i64 {
     if let Some(ts) = timestamp {
-        ts.timestamp_nanos()
+        ts.timestamp_nanos_opt().unwrap()
     } else {
         encode_timestamp(Some(Utc::now()))
     }
@@ -377,8 +379,8 @@ pub(in crate::sinks) fn encode_uri(
 pub mod test_util {
     use std::{fs::File, io::Read};
 
-    use chrono::{offset::TimeZone, DateTime, SecondsFormat, Utc};
-    use vector_core::metric_tags;
+    use chrono::{offset::TimeZone, DateTime, SecondsFormat, Timelike, Utc};
+    use vector_lib::metric_tags;
 
     use super::*;
     use crate::tls;
@@ -388,11 +390,14 @@ pub mod test_util {
     pub(crate) const TOKEN: &str = "my-token";
 
     pub(crate) fn next_database() -> String {
-        format!("testdb{}", Utc::now().timestamp_nanos())
+        format!("testdb{}", Utc::now().timestamp_nanos_opt().unwrap())
     }
 
     pub(crate) fn ts() -> DateTime<Utc> {
-        Utc.ymd(2018, 11, 14).and_hms_nano(8, 9, 10, 11)
+        Utc.with_ymd_and_hms(2018, 11, 14, 8, 9, 10)
+            .single()
+            .and_then(|t| t.with_nanosecond(11))
+            .expect("invalid timestamp")
     }
 
     pub(crate) fn tags() -> MetricTags {
@@ -442,12 +447,12 @@ pub mod test_util {
     // 1542182950000000011
     //
     pub(crate) fn split_line_protocol(line_protocol: &str) -> (&str, &str, String, &str) {
-        let mut split = line_protocol.splitn(2, ',').collect::<Vec<&str>>();
-        let measurement = split[0];
+        let (name, fields) = line_protocol.split_once(' ').unwrap_or_default();
+        // tags and timestamp may not be present
+        let (measurement, tags) = name.split_once(',').unwrap_or((name, ""));
+        let (fields, ts) = fields.split_once(' ').unwrap_or((fields, ""));
 
-        split = split[1].splitn(3, ' ').collect::<Vec<&str>>();
-
-        (measurement, split[0], split[1].to_string(), split[2])
+        (measurement, tags, fields.to_string(), ts)
     }
 
     fn client() -> reqwest::Client {
@@ -466,7 +471,7 @@ pub mod test_util {
 
     pub(crate) async fn query_v1(endpoint: &str, query: &str) -> reqwest::Response {
         client()
-            .get(&format!("{}/query", endpoint))
+            .get(format!("{}/query", endpoint))
             .query(&[("q", query)])
             .send()
             .await
@@ -592,8 +597,8 @@ mod tests {
 
     #[test]
     fn test_influxdb_settings_missing() {
-        let config = r#"
-    "#;
+        let config = r"
+    ";
         let config: InfluxDbTestConfig = toml::from_str(config).unwrap();
         let settings = influxdb_settings(config.influxdb1_settings, config.influxdb2_settings);
         assert_eq!(
@@ -608,7 +613,7 @@ mod tests {
         database = "my-database"
     "#;
         let config: InfluxDbTestConfig = toml::from_str(config).unwrap();
-        let _ = influxdb_settings(config.influxdb1_settings, config.influxdb2_settings).unwrap();
+        _ = influxdb_settings(config.influxdb1_settings, config.influxdb2_settings).unwrap();
     }
 
     #[test]
@@ -619,7 +624,7 @@ mod tests {
         token = "my-token"
     "#;
         let config: InfluxDbTestConfig = toml::from_str(config).unwrap();
-        let _ = influxdb_settings(config.influxdb1_settings, config.influxdb2_settings).unwrap();
+        _ = influxdb_settings(config.influxdb1_settings, config.influxdb2_settings).unwrap();
     }
 
     #[test]
@@ -731,20 +736,17 @@ mod tests {
     #[test]
     fn test_encode_fields_v1() {
         let fields = vec![
+            ("field_string".into(), Field::String("string value".into())),
             (
-                "field_string".to_owned(),
-                Field::String("string value".to_owned()),
+                "field_string_escape".into(),
+                Field::String("string\\val\"ue".into()),
             ),
-            (
-                "field_string_escape".to_owned(),
-                Field::String("string\\val\"ue".to_owned()),
-            ),
-            ("field_float".to_owned(), Field::Float(123.45)),
-            ("field_unsigned_int".to_owned(), Field::UnsignedInt(657)),
-            ("field_int".to_owned(), Field::Int(657646)),
-            ("field_bool_true".to_owned(), Field::Bool(true)),
-            ("field_bool_false".to_owned(), Field::Bool(false)),
-            ("escape key".to_owned(), Field::Float(10.0)),
+            ("field_float".into(), Field::Float(123.45)),
+            ("field_unsigned_int".into(), Field::UnsignedInt(657)),
+            ("field_int".into(), Field::Int(657646)),
+            ("field_bool_true".into(), Field::Bool(true)),
+            ("field_bool_false".into(), Field::Bool(false)),
+            ("escape key".into(), Field::Float(10.0)),
         ]
         .into_iter()
         .collect();
@@ -771,20 +773,17 @@ mod tests {
     #[test]
     fn test_encode_fields() {
         let fields = vec![
+            ("field_string".into(), Field::String("string value".into())),
             (
-                "field_string".to_owned(),
-                Field::String("string value".to_owned()),
+                "field_string_escape".into(),
+                Field::String("string\\val\"ue".into()),
             ),
-            (
-                "field_string_escape".to_owned(),
-                Field::String("string\\val\"ue".to_owned()),
-            ),
-            ("field_float".to_owned(), Field::Float(123.45)),
-            ("field_unsigned_int".to_owned(), Field::UnsignedInt(657)),
-            ("field_int".to_owned(), Field::Int(657646)),
-            ("field_bool_true".to_owned(), Field::Bool(true)),
-            ("field_bool_false".to_owned(), Field::Bool(false)),
-            ("escape key".to_owned(), Field::Float(10.0)),
+            ("field_float".into(), Field::Float(123.45)),
+            ("field_unsigned_int".into(), Field::UnsignedInt(657)),
+            ("field_int".into(), Field::Int(657646)),
+            ("field_bool_true".into(), Field::Bool(true)),
+            ("field_bool_false".into(), Field::Bool(false)),
+            ("escape key".into(), Field::Float(10.0)),
         ]
         .into_iter()
         .collect();
@@ -829,7 +828,9 @@ mod tests {
 
     #[test]
     fn test_encode_timestamp() {
-        let start = Utc::now().timestamp_nanos();
+        let start = Utc::now()
+            .timestamp_nanos_opt()
+            .expect("Timestamp out of range");
         assert_eq!(encode_timestamp(Some(ts())), 1542182950000000011);
         assert!(encode_timestamp(None) >= start)
     }

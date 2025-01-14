@@ -88,21 +88,6 @@ end
 # Helpers for caching resolved/expanded schemas and detecting schema resolution cycles.
 @resolved_schema_cache = {}
 @expanded_schema_cache = {}
-@schema_resolution_queue = {}
-
-def add_to_schema_resolution_stack(schema_name)
-  @logger.debug "Adding '#{schema_name}' to resolution stack."
-  @schema_resolution_queue[schema_name] = true
-end
-
-def remove_from_schema_resolution_stack(schema_name)
-  @logger.debug "Removing '#{schema_name}' from resolution stack."
-  @schema_resolution_queue.delete(schema_name)
-end
-
-def schema_resolution_cycle?(schema_name)
-  @schema_resolution_queue.key?(schema_name)
-end
 
 # Gets the schema of the given `name` from the resolved schema cache, if it exists.
 def get_cached_resolved_schema(schema_name)
@@ -519,11 +504,6 @@ end
 # For any overlapping fields in the given schema and the referenced schema, the fields from the
 # given schema will win.
 def expand_schema_references(root_schema, unexpanded_schema)
-  # Break any cycles during expansion, the same as we do during resolution.
-  if get_schema_metadata(unexpanded_schema, 'docs::cycle_entrypoint')
-    return unexpanded_schema
-  end
-
   schema = deep_copy(unexpanded_schema)
 
   # Grab the existing title/description from our unexpanded schema, and reset them after
@@ -594,6 +574,17 @@ def expand_schema_references(root_schema, unexpanded_schema)
 
     if !schema['oneOf'].nil?
       schema['oneOf'] = schema['oneOf'].map { |subschema|
+        new_subschema = expand_schema_references(root_schema, subschema)
+        if new_subschema != subschema
+          expanded = true
+        end
+
+        new_subschema
+      }
+    end
+
+    if !schema['anyOf'].nil?
+      schema['anyOf'] = schema['anyOf'].map { |subschema|
         new_subschema = expand_schema_references(root_schema, subschema)
         if new_subschema != subschema
           expanded = true
@@ -710,21 +701,9 @@ def resolve_schema_by_name(root_schema, schema_name)
   resolved = get_cached_resolved_schema(schema_name)
   return deep_copy(resolved) unless resolved.nil?
 
-  if schema_resolution_cycle?(schema_name)
-    @logger.error "Cycle detected while resolving schema '#{schema_name}'. \
-    \
-    Cycles must be broken manually at the source code level by annotating fields that induce \
-    cycles with `#[configurable(metadata(docs::cycle_entrypoint))]`. As such a field will have no type \
-    information rendered, it is advised to supply a sufficiently detailed field description that \
-    describes the allowable values, etc."
-    exit 1
-  end
-
   # It wasn't already cached, so we actually have to resolve it.
   schema = get_schema_by_name(root_schema, schema_name)
-  add_to_schema_resolution_stack(schema_name)
   resolved = resolve_schema(root_schema, schema)
-  remove_from_schema_resolution_stack(schema_name)
   @resolved_schema_cache[schema_name] = resolved
   deep_copy(resolved)
 end
@@ -756,21 +735,6 @@ def resolve_schema(root_schema, schema)
     return
   end
 
-  # Avoid schemas that represent a resolution cycle.
-  #
-  # When a schema is marked as a "cycle entrypoint", this means the schema is self-referential (i.e.
-  # the `pipelines` transform, which is part of `Transforms`, having a field that references
-  # `Transforms`) and we have to break the cycle.
-  #
-  # We have to return _something_, as it's a real part of the schema, so we just return a basic
-  # schema with no type information but with any description that is specified, etc.
-  if get_schema_metadata(schema, 'docs::cycle_entrypoint')
-    resolved = { 'type' => 'blank' }
-    description = get_rendered_description_from_schema(schema)
-    resolved['description'] = description unless description.empty?
-    return resolved
-  end
-
   # Handle schemas that have type overrides.
   #
   # In order to better represent specific field types in the documentation, we may opt to use a
@@ -780,9 +744,23 @@ def resolve_schema(root_schema, schema)
   #
   # We intentially set no actual definition for these types, relying on the documentation generation
   # process to provide the actual details. We only need to specify the custom type name.
+  #
+  # To handle u8 types as ascii characters and not there uint representation between 0 and 255 we
+  # added a special handling of these exact values. This means
+  # `#[configurable(metadata(docs::type_override = "ascii_char"))]` should only be used consciously
+  # for rust u8 type. See lib/codecs/src/encoding/format/csv.rs for an example and
+  # https://github.com/vectordotdev/vector/pull/20498
   type_override = get_schema_metadata(schema, 'docs::type_override')
   if !type_override.nil?
-    resolved = { 'type' => { type_override.to_s => {} } }
+    if type_override == 'ascii_char'
+      if !schema['default'].nil?
+        resolved = { 'type' => { type_override.to_s => { 'default' => schema['default'].chr } } }
+      else
+        resolved = { 'type' => { type_override.to_s => { } } }
+      end
+    else
+      resolved = { 'type' => { type_override.to_s => {} } }
+    end
     description = get_rendered_description_from_schema(schema)
     resolved['description'] = description unless description.empty?
     return resolved
@@ -914,10 +892,10 @@ def resolve_bare_schema(root_schema, schema)
           @logger.error "Relevant schema: #{JSON.pretty_generate(schema)}"
           exit 1
         end
-        additional_properties['description'] = singular_description
 
         resolved_additional_properties = resolve_schema(root_schema, additional_properties)
         resolved_additional_properties['required'] = true
+        resolved_additional_properties['description'] = singular_description
         options.push(['*', resolved_additional_properties])
       end
 
@@ -1590,7 +1568,7 @@ def reconcile_resolved_schema!(resolved_schema)
     # This means that we can generate output for a field that says it has a default value of `null`
     # but is a required field, which is a logical inconsistency in terms of the Cue schema where we
     # import the generated output of this script: it doesn't allow setting a default value for a field
-    # if the field is required, and vise versa.
+    # if the field is required, and vice versa.
     if resolved_schema['required']
       # For all schema type fields, see if they have a default value equal to `nil`. If so, remove
       # the `default` field entirely.
@@ -1635,7 +1613,6 @@ def reconcile_resolved_schema!(resolved_schema)
         enum_values = if const_type_field.is_a?(Array)
           const_type_field
             .map { |const| [const['value'], const['description']] }
-            .add_to_schema_resolution_stack
         else
           # If the value isn't already an array, we'll create the enum values map directly.
           { const_type_field['value'] => const_type_field['description'] }

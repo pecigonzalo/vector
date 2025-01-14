@@ -1,6 +1,5 @@
 use bytes::{Buf, Bytes, BytesMut};
 use memchr::memchr;
-use serde::{Deserialize, Serialize};
 use tokio_util::codec::Decoder;
 use tracing::{trace, warn};
 use vector_config::configurable_component;
@@ -8,13 +7,20 @@ use vector_config::configurable_component;
 use super::BoxedFramingError;
 
 /// Config used to build a `CharacterDelimitedDecoder`.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[configurable_component]
+#[derive(Debug, Clone)]
 pub struct CharacterDelimitedDecoderConfig {
     /// Options for the character delimited decoder.
     pub character_delimited: CharacterDelimitedDecoderOptions,
 }
 
 impl CharacterDelimitedDecoderConfig {
+    /// Creates a `CharacterDelimitedDecoderConfig` with the specified delimiter and default max length.
+    pub const fn new(delimiter: u8) -> Self {
+        Self {
+            character_delimited: CharacterDelimitedDecoderOptions::new(delimiter, None),
+        }
+    }
     /// Build the `CharacterDelimitedDecoder` from this configuration.
     pub const fn build(&self) -> CharacterDelimitedDecoder {
         if let Some(max_length) = self.character_delimited.max_length {
@@ -33,6 +39,7 @@ impl CharacterDelimitedDecoderConfig {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CharacterDelimitedDecoderOptions {
     /// The character that delimits byte sequences.
+    #[configurable(metadata(docs::type_override = "ascii_char"))]
     #[serde(with = "vector_core::serde::ascii_char")]
     pub delimiter: u8,
 
@@ -47,13 +54,13 @@ pub struct CharacterDelimitedDecoderOptions {
     /// If there is a risk of processing malformed data, such as logs with user-controlled input,
     /// consider setting the maximum length to a reasonably large value as a safety net. This
     /// ensures that processing is not actually unbounded.
-    #[serde(skip_serializing_if = "vector_core::serde::skip_serializing_if_default")]
+    #[serde(skip_serializing_if = "vector_core::serde::is_default")]
     pub max_length: Option<usize>,
 }
 
 impl CharacterDelimitedDecoderOptions {
     /// Create a `CharacterDelimitedDecoderOptions` with a delimiter and optional max_length.
-    pub fn new(delimiter: u8, max_length: Option<usize>) -> Self {
+    pub const fn new(delimiter: u8, max_length: Option<usize>) -> Self {
         Self {
             delimiter,
             max_length,

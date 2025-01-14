@@ -1,5 +1,9 @@
 name: Release Suite
 
+permissions:
+  contents: write
+  packages: write
+
 on:
   push:
     tags:
@@ -11,5 +15,5 @@ jobs:
     uses: ./.github/workflows/publish.yml
     with:
       git_ref: ${{ github.ref }}
-      mode: Release
+      channel: release
     secrets: inherit

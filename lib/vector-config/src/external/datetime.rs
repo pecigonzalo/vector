@@ -8,8 +8,8 @@ use crate::{
 use chrono_tz::Tz;
 use serde_json::Value;
 use std::cell::RefCell;
-use vector_config_common::attributes::CustomAttribute;
-use vrl_core::TimeZone;
+use vector_config_common::{attributes::CustomAttribute, constants};
+use vrl::compiler::TimeZone;
 
 // TODO: Consider an approach for generating schema of "fixed string value, or remainder" structure
 // used by this type.
@@ -20,14 +20,23 @@ impl Configurable for TimeZone {
 
     fn metadata() -> Metadata {
         let mut metadata = Metadata::default();
-        metadata.set_title("Timezone reference.");
-        metadata.set_description(r#"This can refer to any valid timezone as defined in the [TZ database][tzdb], or "local" which refers to the system local timezone.
+        metadata.set_title("Timezone to use for any date specifiers in template strings.");
+        metadata.set_description(r#"This can refer to any valid timezone as defined in the [TZ database][tzdb], or "local" which refers to the system local timezone. It will default to the [globally configured timezone](https://vector.dev/docs/reference/configuration/global-options/#timezone).
 
 [tzdb]: https://en.wikipedia.org/wiki/List_of_tz_database_time_zones"#);
-        metadata.add_custom_attribute(CustomAttribute::kv("docs::enum_tagging", "untagged"));
-        metadata.add_custom_attribute(CustomAttribute::kv("docs::examples", "local"));
-        metadata.add_custom_attribute(CustomAttribute::kv("docs::examples", "America/New_York"));
-        metadata.add_custom_attribute(CustomAttribute::kv("docs::examples", "EST5EDT"));
+        metadata.add_custom_attribute(CustomAttribute::kv(
+            constants::DOCS_META_ENUM_TAGGING,
+            "untagged",
+        ));
+        metadata.add_custom_attribute(CustomAttribute::kv(constants::DOCS_META_EXAMPLES, "local"));
+        metadata.add_custom_attribute(CustomAttribute::kv(
+            constants::DOCS_META_EXAMPLES,
+            "America/New_York",
+        ));
+        metadata.add_custom_attribute(CustomAttribute::kv(
+            constants::DOCS_META_EXAMPLES,
+            "EST5EDT",
+        ));
         metadata
     }
 

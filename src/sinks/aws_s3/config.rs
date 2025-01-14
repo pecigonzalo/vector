@@ -1,22 +1,18 @@
-use std::convert::TryInto;
-
 use aws_sdk_s3::Client as S3Client;
-use codecs::{
+use tower::ServiceBuilder;
+use vector_lib::codecs::{
     encoding::{Framer, FramingConfig},
     TextSerializerConfig,
 };
-use tower::ServiceBuilder;
-use vector_config::configurable_component;
-use vector_core::sink::VectorSink;
+use vector_lib::configurable::configurable_component;
+use vector_lib::sink::VectorSink;
+use vector_lib::TimeZone;
 
 use super::sink::S3RequestOptions;
 use crate::{
     aws::{AwsAuthentication, RegionOrEndpoint},
     codecs::{Encoder, EncodingConfigWithFraming, SinkType},
-    config::{
-        AcknowledgementsConfig, DataType, GenerateConfig, Input, ProxyConfig, SinkConfig,
-        SinkContext,
-    },
+    config::{AcknowledgementsConfig, GenerateConfig, Input, ProxyConfig, SinkConfig, SinkContext},
     sinks::{
         s3_common::{
             self,
@@ -26,8 +22,8 @@ use crate::{
             sink::S3Sink,
         },
         util::{
-            BatchConfig, BulkSizeBasedDefaultBatchSettings, Compression, ServiceBuilderExt,
-            TowerRequestConfig,
+            timezone_to_offset, BatchConfig, BulkSizeBasedDefaultBatchSettings, Compression,
+            ServiceBuilderExt, TowerRequestConfig,
         },
         Healthcheck,
     },
@@ -36,7 +32,10 @@ use crate::{
 };
 
 /// Configuration for the `aws_s3` sink.
-#[configurable_component(sink("aws_s3"))]
+#[configurable_component(sink(
+    "aws_s3",
+    "Store observability events in the AWS S3 object storage system."
+))]
 #[derive(Clone, Debug)]
 #[serde(deny_unknown_fields)]
 pub struct S3SinkConfig {
@@ -49,7 +48,7 @@ pub struct S3SinkConfig {
     /// A prefix to apply to all object keys.
     ///
     /// Prefixes are useful for partitioning objects, such as by creating an object key that
-    /// stores objects under a particular "directory". If using a prefix for this purpose, it must end
+    /// stores objects under a particular directory. If using a prefix for this purpose, it must end
     /// in `/` to act as a directory path. A trailing `/` is **not** automatically added.
     #[serde(default = "default_key_prefix")]
     #[configurable(metadata(docs::templateable))]
@@ -71,7 +70,7 @@ pub struct S3SinkConfig {
     /// Supports the common [`strftime`][chrono_strftime_specifiers] specifiers found in most
     /// languages.
     ///
-    /// When set to an empty string, no timestamp will be appended to the key prefix.
+    /// When set to an empty string, no timestamp is appended to the key prefix.
     ///
     /// [chrono_strftime_specifiers]: https://docs.rs/chrono/latest/chrono/format/strftime/index.html#specifiers
     #[serde(default = "default_filename_time_format")]
@@ -80,12 +79,13 @@ pub struct S3SinkConfig {
     /// Whether or not to append a UUID v4 token to the end of the object key.
     ///
     /// The UUID is appended to the timestamp portion of the object key, such that if the object key
-    /// being generated was `date=2022-07-18/1658176486`, setting this field to `true` would result
-    /// in an object key that looked like `date=2022-07-18/1658176486-30f6652c-71da-4f9f-800d-a1189c47c547`.
+    /// generated is `date=2022-07-18/1658176486`, setting this field to `true` results
+    /// in an object key that looks like `date=2022-07-18/1658176486-30f6652c-71da-4f9f-800d-a1189c47c547`.
     ///
     /// This ensures there are no name collisions, and can be useful in high-volume workloads where
     /// object keys must be unique.
     #[serde(default = "crate::serde::default_true")]
+    #[configurable(metadata(docs::human_name = "Append UUID to Filename"))]
     pub filename_append_uuid: bool,
 
     /// The filename extension to use in the object key.
@@ -107,8 +107,8 @@ pub struct S3SinkConfig {
     ///
     /// All compression algorithms use the default compression level unless otherwise specified.
     ///
-    /// Some cloud storage API clients and browsers will handle decompression transparently, so
-    /// files may not always appear to be compressed depending how they are accessed.
+    /// Some cloud storage API clients and browsers handle decompression transparently, so
+    /// depending on how they are accessed, files may not always appear to be compressed.
     #[configurable(derived)]
     #[serde(default = "Compression::gzip_default")]
     pub compression: Compression,
@@ -132,9 +132,19 @@ pub struct S3SinkConfig {
     #[serde(
         default,
         deserialize_with = "crate::serde::bool_or_struct",
-        skip_serializing_if = "crate::serde::skip_serializing_if_default"
+        skip_serializing_if = "crate::serde::is_default"
     )]
     pub acknowledgements: AcknowledgementsConfig,
+
+    #[configurable(derived)]
+    #[serde(default)]
+    pub timezone: Option<TimeZone>,
+
+    /// Specifies which addressing style to use.
+    ///
+    /// This controls if the bucket name is in the hostname or part of the URL.
+    #[serde(default = "crate::serde::default_true")]
+    pub force_path_style: bool,
 }
 
 pub(super) fn default_key_prefix() -> String {
@@ -162,22 +172,25 @@ impl GenerateConfig for S3SinkConfig {
             tls: Some(TlsConfig::default()),
             auth: AwsAuthentication::default(),
             acknowledgements: Default::default(),
+            timezone: Default::default(),
+            force_path_style: Default::default(),
         })
         .unwrap()
     }
 }
 
 #[async_trait::async_trait]
+#[typetag::serde(name = "aws_s3")]
 impl SinkConfig for S3SinkConfig {
     async fn build(&self, cx: SinkContext) -> crate::Result<(VectorSink, Healthcheck)> {
         let service = self.create_service(&cx.proxy).await?;
         let healthcheck = self.build_healthcheck(service.client())?;
-        let sink = self.build_processor(service)?;
+        let sink = self.build_processor(service, cx)?;
         Ok((sink, healthcheck))
     }
 
     fn input(&self) -> Input {
-        Input::new(self.encoding.config().1.input_type() & DataType::Log)
+        Input::new(self.encoding.config().1.input_type())
     }
 
     fn acknowledgements(&self) -> &AcknowledgementsConfig {
@@ -186,19 +199,30 @@ impl SinkConfig for S3SinkConfig {
 }
 
 impl S3SinkConfig {
-    pub fn build_processor(&self, service: S3Service) -> crate::Result<VectorSink> {
+    pub fn build_processor(
+        &self,
+        service: S3Service,
+        cx: SinkContext,
+    ) -> crate::Result<VectorSink> {
         // Build our S3 client/service, which is what we'll ultimately feed
         // requests into in order to ship files to S3.  We build this here in
         // order to configure the client/service with retries, concurrency
         // limits, rate limits, and whatever else the client should have.
-        let request_limits = self.request.unwrap_with(&Default::default());
+        let request_limits = self.request.into_settings();
         let service = ServiceBuilder::new()
             .settings(request_limits, S3RetryLogic)
             .service(service);
 
+        let offset = self
+            .timezone
+            .or(cx.globals.timezone)
+            .and_then(timezone_to_offset);
+
         // Configure our partitioning/batching.
         let batch_settings = self.batch.into_batcher_settings()?;
-        let key_prefix = self.key_prefix.clone().try_into()?;
+
+        let key_prefix = Template::try_from(self.key_prefix.clone())?.with_tz_offset(offset);
+
         let ssekms_key_id = self
             .options
             .ssekms_key_id
@@ -206,7 +230,8 @@ impl S3SinkConfig {
             .cloned()
             .map(|ssekms_key_id| Template::try_from(ssekms_key_id.as_str()))
             .transpose()?;
-        let partitioner = S3KeyPartitioner::new(key_prefix, ssekms_key_id);
+
+        let partitioner = S3KeyPartitioner::new(key_prefix, ssekms_key_id, None);
 
         let transformer = self.encoding.transformer();
         let (framer, serializer) = self.encoding.build(SinkType::MessageBased)?;
@@ -220,6 +245,7 @@ impl S3SinkConfig {
             filename_append_uuid: self.filename_append_uuid,
             encoder: (transformer, encoder),
             compression: self.compression,
+            filename_tz_offset: offset,
         };
 
         let sink = S3Sink::new(service, request_options, partitioner, batch_settings);
@@ -232,7 +258,14 @@ impl S3SinkConfig {
     }
 
     pub async fn create_service(&self, proxy: &ProxyConfig) -> crate::Result<S3Service> {
-        s3_common::config::create_service(&self.region, &self.auth, proxy, &self.tls).await
+        s3_common::config::create_service(
+            &self.region,
+            &self.auth,
+            proxy,
+            self.tls.as_ref(),
+            self.force_path_style,
+        )
+        .await
     }
 }
 

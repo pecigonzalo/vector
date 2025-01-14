@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::io::{self, Read};
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -5,25 +6,26 @@ use std::time::Duration;
 use base64::prelude::{Engine as _, BASE64_STANDARD};
 use bytes::{Buf, Bytes, BytesMut};
 use chrono::Utc;
-use codecs::{BytesDeserializerConfig, StreamDecodingError};
 use flate2::read::MultiGzDecoder;
-use lookup::lookup_v2::parse_value_path;
-use lookup::{metadata_path, owned_value_path, path, OwnedValuePath, PathPrefix};
-use rmp_serde::{decode, Deserializer};
-use serde::Deserialize;
+use rmp_serde::{decode, Deserializer, Serializer};
+use serde::{Deserialize, Serialize};
 use smallvec::{smallvec, SmallVec};
 use tokio_util::codec::Decoder;
-use value::kind::Collection;
-use value::{Kind, Value};
-use vector_config::configurable_component;
-use vector_core::config::{LegacyKey, LogNamespace};
-use vector_core::schema::Definition;
+use vector_lib::codecs::{BytesDeserializerConfig, StreamDecodingError};
+use vector_lib::config::{LegacyKey, LogNamespace};
+use vector_lib::configurable::configurable_component;
+use vector_lib::ipallowlist::IpAllowlistConfig;
+use vector_lib::lookup::lookup_v2::parse_value_path;
+use vector_lib::lookup::{metadata_path, owned_value_path, path, OwnedValuePath};
+use vector_lib::schema::Definition;
+use vrl::value::kind::Collection;
+use vrl::value::{Kind, Value};
 
 use super::util::net::{SocketListenAddr, TcpSource, TcpSourceAck, TcpSourceAcker};
 use crate::{
     config::{
-        log_schema, DataType, GenerateConfig, Output, Resource, SourceAcknowledgementsConfig,
-        SourceConfig, SourceContext,
+        log_schema, DataType, GenerateConfig, Resource, SourceAcknowledgementsConfig, SourceConfig,
+        SourceContext, SourceOutput,
     },
     event::{Event, LogEvent},
     internal_events::{FluentMessageDecodeError, FluentMessageReceived},
@@ -36,7 +38,7 @@ mod message;
 use self::message::{FluentEntry, FluentMessage, FluentRecord, FluentTag, FluentTimestamp};
 
 /// Configuration for the `fluent` source.
-#[configurable_component(source("fluent"))]
+#[configurable_component(source("fluent", "Collect logs from a Fluentd or Fluent Bit agent."))]
 #[derive(Clone, Debug)]
 pub struct FluentConfig {
     #[configurable(derived)]
@@ -48,6 +50,9 @@ pub struct FluentConfig {
 
     #[configurable(derived)]
     keepalive: Option<TcpKeepaliveConfig>,
+
+    #[configurable(derived)]
+    pub permit_origin: Option<IpAllowlistConfig>,
 
     /// The size of the receive buffer used for each connection.
     ///
@@ -74,6 +79,7 @@ impl GenerateConfig for FluentConfig {
         toml::Value::try_from(Self {
             address: SocketListenAddr::SocketAddr("0.0.0.0:24224".parse().unwrap()),
             keepalive: None,
+            permit_origin: None,
             tls: None,
             receive_buffer_bytes: None,
             acknowledgements: Default::default(),
@@ -85,6 +91,7 @@ impl GenerateConfig for FluentConfig {
 }
 
 #[async_trait::async_trait]
+#[typetag::serde(name = "fluent")]
 impl SourceConfig for FluentConfig {
     async fn build(&self, cx: SourceContext) -> crate::Result<super::Source> {
         let log_namespace = cx.log_namespace(self.log_namespace);
@@ -96,7 +103,7 @@ impl SourceConfig for FluentConfig {
             .as_ref()
             .and_then(|tls| tls.client_metadata_key.clone())
             .and_then(|k| k.path);
-        let tls = MaybeTlsSettings::from_config(&tls_config, true)?;
+        let tls = MaybeTlsSettings::from_config(tls_config.as_ref(), true)?;
         source.run(
             self.address,
             self.keepalive,
@@ -108,16 +115,20 @@ impl SourceConfig for FluentConfig {
             cx,
             self.acknowledgements,
             self.connection_limit,
+            self.permit_origin.clone().map(Into::into),
             FluentConfig::NAME,
             log_namespace,
         )
     }
 
-    fn outputs(&self, global_log_namespace: LogNamespace) -> Vec<Output> {
+    fn outputs(&self, global_log_namespace: LogNamespace) -> Vec<SourceOutput> {
         let log_namespace = global_log_namespace.merge(self.log_namespace);
         let schema_definition = self.schema_definition(log_namespace);
 
-        vec![Output::default(DataType::Log).with_schema_definition(schema_definition)]
+        vec![SourceOutput::new_maybe_logs(
+            DataType::Log,
+            schema_definition,
+        )]
     }
 
     fn resources(&self) -> Vec<Resource> {
@@ -133,8 +144,9 @@ impl FluentConfig {
     /// Builds the `schema::Definition` for this source using the provided `LogNamespace`.
     fn schema_definition(&self, log_namespace: LogNamespace) -> Definition {
         // `host_key` is only inserted if not present already.
-        let host_key = parse_value_path(log_schema().host_key())
-            .ok()
+        let host_key = log_schema()
+            .host_key()
+            .cloned()
             .map(LegacyKey::InsertIfEmpty);
 
         let tag_key = parse_value_path("tag").ok().map(LegacyKey::Overwrite);
@@ -207,7 +219,7 @@ impl FluentSource {
     fn new(log_namespace: LogNamespace) -> Self {
         Self {
             log_namespace,
-            legacy_host_key_path: parse_value_path(log_schema().host_key()).ok(),
+            legacy_host_key_path: log_schema().host_key().cloned(),
         }
     }
 }
@@ -461,13 +473,12 @@ impl Decoder for FluentDecoder {
 
             src.advance(byte_size);
 
-            let maybe_item = self.handle_message(res, byte_size).map_err(|error| {
-                let base64_encoded_message = BASE64_STANDARD.encode(&src);
+            let maybe_item = self.handle_message(res, byte_size).inspect_err(|error| {
+                let base64_encoded_message = BASE64_STANDARD.encode(&src[..]);
                 emit!(FluentMessageDecodeError {
-                    error: &error,
+                    error,
                     base64_encoded_message
                 });
-                error
             })?;
             if let Some(item) = maybe_item {
                 return Ok(Some(item));
@@ -531,15 +542,18 @@ impl TcpSourceAcker for FluentAcker {
             return None;
         }
 
-        let mut acks = String::new();
+        let mut buf = Vec::new();
+        let mut ser = Serializer::new(&mut buf);
+        let mut ack_map = HashMap::new();
+
         for chunk in self.chunks {
-            let ack = match ack {
-                TcpSourceAck::Ack => format!(r#"{{"ack": "{}"}}"#, chunk),
-                _ => String::from("{}"),
+            ack_map.clear();
+            if let TcpSourceAck::Ack = ack {
+                ack_map.insert("ack", chunk);
             };
-            acks.push_str(&ack);
+            ack_map.serialize(&mut ser).unwrap();
         }
-        Some(acks.into())
+        Some(buf.into())
     }
 }
 
@@ -582,7 +596,7 @@ impl From<FluentEvent<'_>> for LogEvent {
 
         log_namespace.insert_vector_metadata(
             &mut log,
-            Some(log_schema().source_type_key()),
+            log_schema().source_type_key(),
             path!("source_type"),
             Bytes::from_static(FluentConfig::NAME.as_bytes()),
         );
@@ -593,9 +607,7 @@ impl From<FluentEvent<'_>> for LogEvent {
                 log.insert(metadata_path!("vector", "ingest_timestamp"), Utc::now());
             }
             LogNamespace::Legacy => {
-                if let Some(timestamp_key) = log_schema().timestamp_key() {
-                    log.insert((PathPrefix::Event, timestamp_key), timestamp);
-                }
+                log.maybe_insert(log_schema().timestamp_key_target_path(), timestamp);
             }
         }
 
@@ -625,18 +637,17 @@ impl From<FluentEvent<'_>> for LogEvent {
 mod tests {
     use bytes::BytesMut;
     use chrono::{DateTime, Utc};
-    use lookup::OwnedTargetPath;
     use rmp_serde::Serializer;
     use serde::Serialize;
-    use std::collections::BTreeMap;
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         time::{error::Elapsed, timeout, Duration},
     };
     use tokio_util::codec::Decoder;
-    use value::kind::Collection;
-    use vector_common::assert_event_data_eq;
-    use vector_core::{event::Value, schema::Definition};
+    use vector_lib::assert_event_data_eq;
+    use vector_lib::lookup::OwnedTargetPath;
+    use vector_lib::schema::Definition;
+    use vrl::value::{kind::Collection, ObjectMap, Value};
 
     use super::{message::FluentMessageOptions, *};
     use crate::{
@@ -657,15 +668,15 @@ mod tests {
     // Decode base64: https://toolslick.com/conversion/data/messagepack-to-json
 
     fn mock_event(name: &str, timestamp: &str) -> Event {
-        Event::Log(LogEvent::from(BTreeMap::from([
-            (String::from("message"), Value::from(name)),
+        Event::Log(LogEvent::from(ObjectMap::from([
+            ("message".into(), Value::from(name)),
             (
-                String::from(log_schema().source_type_key()),
+                log_schema().source_type_key().unwrap().to_string().into(),
                 Value::from(FluentConfig::NAME),
             ),
-            (String::from("tag"), Value::from("tag.name")),
+            ("tag".into(), Value::from("tag.name")),
             (
-                String::from("timestamp"),
+                "timestamp".into(),
                 Value::Timestamp(DateTime::parse_from_rfc3339(timestamp).unwrap().into()),
             ),
         ])))
@@ -852,7 +863,7 @@ mod tests {
     #[tokio::test]
     async fn ack_delivered_without_chunk() {
         let (result, output) = check_acknowledgements(EventStatus::Delivered, false).await;
-        assert!(matches!(result, Err(_))); // the `_` inside this error is `Elapsed`
+        assert!(result.is_err()); // the `_` inside this error is `Elapsed`
         assert!(output.is_empty());
     }
 
@@ -860,7 +871,8 @@ mod tests {
     async fn ack_delivered_with_chunk() {
         let (result, output) = check_acknowledgements(EventStatus::Delivered, true).await;
         assert_eq!(result.unwrap().unwrap(), output.len());
-        assert!(output.starts_with(b"{\"ack\":"));
+        let expected: Vec<u8> = vec![0x81, 0xa3, 0x61, 0x63]; // { "ack": ...
+        assert_eq!(output[..expected.len()], expected);
     }
 
     #[tokio::test]
@@ -874,7 +886,8 @@ mod tests {
     async fn ack_failed_with_chunk() {
         let (result, output) = check_acknowledgements(EventStatus::Rejected, true).await;
         assert_eq!(result.unwrap().unwrap(), output.len());
-        assert_eq!(output, &b"{}"[..]);
+        let expected: Vec<u8> = vec![0x80]; // { }
+        assert_eq!(output, expected);
     }
 
     async fn check_acknowledgements(
@@ -889,6 +902,7 @@ mod tests {
             address: address.into(),
             tls: None,
             keepalive: None,
+            permit_origin: None,
             receive_buffer_bytes: None,
             acknowledgements: true.into(),
             connection_limit: None,
@@ -953,16 +967,17 @@ mod tests {
             address: SocketListenAddr::SocketAddr("0.0.0.0:24224".parse().unwrap()),
             tls: None,
             keepalive: None,
+            permit_origin: None,
             receive_buffer_bytes: None,
             acknowledgements: false.into(),
             connection_limit: None,
             log_namespace: Some(true),
         };
 
-        let definition = config.outputs(LogNamespace::Vector)[0]
-            .clone()
-            .log_schema_definition
-            .unwrap();
+        let definitions = config
+            .outputs(LogNamespace::Vector)
+            .remove(0)
+            .schema_definition(true);
 
         let expected_definition =
             Definition::new_with_default_metadata(Kind::bytes(), [LogNamespace::Vector])
@@ -999,7 +1014,7 @@ mod tests {
                     None,
                 );
 
-        assert_eq!(definition, expected_definition)
+        assert_eq!(definitions, Some(expected_definition))
     }
 
     #[test]
@@ -1008,16 +1023,17 @@ mod tests {
             address: SocketListenAddr::SocketAddr("0.0.0.0:24224".parse().unwrap()),
             tls: None,
             keepalive: None,
+            permit_origin: None,
             receive_buffer_bytes: None,
             acknowledgements: false.into(),
             connection_limit: None,
             log_namespace: None,
         };
 
-        let definition = config.outputs(LogNamespace::Legacy)[0]
-            .clone()
-            .log_schema_definition
-            .unwrap();
+        let definitions = config
+            .outputs(LogNamespace::Legacy)
+            .remove(0)
+            .schema_definition(true);
 
         let expected_definition = Definition::new_with_default_metadata(
             Kind::object(Collection::empty()),
@@ -1034,7 +1050,7 @@ mod tests {
         .with_event_field(&owned_value_path!("host"), Kind::bytes(), Some("host"))
         .unknown_fields(Kind::bytes());
 
-        assert_eq!(definition, expected_definition)
+        assert_eq!(definitions, Some(expected_definition))
     }
 }
 
@@ -1044,7 +1060,7 @@ mod integration_tests {
 
     use futures::Stream;
     use tokio::time::sleep;
-    use vector_core::event::{Event, EventStatus};
+    use vector_lib::event::{Event, EventStatus};
 
     use crate::{
         config::{SourceConfig, SourceContext},
@@ -1120,7 +1136,7 @@ mod integration_tests {
                 .run(async move {
                     wait_for_tcp(test_address).await;
                     reqwest::Client::new()
-                        .post(&format!("http://{}/", test_address))
+                        .post(format!("http://{}/", test_address))
                         .header("content-type", "application/json")
                         .body(body.to_string())
                         .send()
@@ -1201,7 +1217,7 @@ mod integration_tests {
                 .run(async move {
                     wait_for_tcp(test_address).await;
                     reqwest::Client::new()
-                        .post(&format!("http://{}/", test_address))
+                        .post(format!("http://{}/", test_address))
                         .header("content-type", "application/json")
                         .body(body.to_string())
                         .send()
@@ -1229,6 +1245,7 @@ mod integration_tests {
                 address: address.into(),
                 tls: None,
                 keepalive: None,
+                permit_origin: None,
                 receive_buffer_bytes: None,
                 acknowledgements: false.into(),
                 connection_limit: None,

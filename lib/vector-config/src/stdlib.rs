@@ -13,7 +13,8 @@ use std::{
 
 use indexmap::IndexMap;
 use serde_json::{Number, Value};
-use vector_config_common::{attributes::CustomAttribute, validation::Validation};
+use vector_config_common::{attributes::CustomAttribute, constants, validation::Validation};
+use vrl::value::KeyString;
 
 use crate::{
     num::ConfigurableNumber,
@@ -113,6 +114,22 @@ impl ToValue for String {
     }
 }
 
+impl Configurable for KeyString {
+    fn metadata() -> Metadata {
+        Metadata::with_transparent(true)
+    }
+
+    fn generate_schema(_: &RefCell<SchemaGenerator>) -> Result<SchemaObject, GenerateError> {
+        Ok(generate_string_schema())
+    }
+}
+
+impl ToValue for KeyString {
+    fn to_value(&self) -> Value {
+        Value::String(self.clone().into())
+    }
+}
+
 impl Configurable for char {
     fn metadata() -> Metadata {
         let mut metadata = Metadata::with_transparent(true);
@@ -141,8 +158,10 @@ macro_rules! impl_configurable_numeric {
             fn metadata() -> Metadata {
                 let mut metadata = Metadata::with_transparent(true);
                 let numeric_type = <Self as ConfigurableNumber>::class();
-                metadata
-                    .add_custom_attribute(CustomAttribute::kv("docs::numeric_type", numeric_type));
+                metadata.add_custom_attribute(CustomAttribute::kv(
+                    constants::DOCS_META_NUMERIC_TYPE,
+                    numeric_type,
+                ));
 
                 metadata
             }

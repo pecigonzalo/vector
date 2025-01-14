@@ -1,4 +1,4 @@
-use std::{collections::HashSet, env, fs::File, io::Write, path::Path};
+use std::{collections::HashSet, env, fs::File, io::Write, path::Path, process::Command};
 
 struct TrackedEnv {
     tracked: HashSet<String>,
@@ -93,22 +93,49 @@ impl BuildConstants {
     }
 }
 
+fn git_short_hash() -> std::io::Result<String> {
+    let output_result = Command::new("git")
+        .args(["rev-parse", "--short", "HEAD"])
+        .output();
+
+    output_result.map(|output| {
+        let mut hash = String::from_utf8(output.stdout).expect("valid UTF-8");
+        hash.retain(|c| !c.is_ascii_whitespace());
+
+        hash
+    })
+}
+
 fn main() {
     // Always rerun if the build script itself changes.
     println!("cargo:rerun-if-changed=build.rs");
 
+    // re-run if the HEAD has changed. This is only necessary for non-release and nightly builds.
+    #[cfg(not(feature = "nightly"))]
+    println!("cargo:rerun-if-changed=.git/HEAD");
+
     #[cfg(feature = "protobuf-build")]
     {
-        println!("cargo:rerun-if-changed=proto/dd_trace.proto");
-        println!("cargo:rerun-if-changed=proto/dnstap.proto");
-        println!("cargo:rerun-if-changed=proto/ddsketch_full.proto");
-        println!("cargo:rerun-if-changed=proto/dd_metric.proto");
-        println!("cargo:rerun-if-changed=proto/google/pubsub/v1/pubsub.proto");
-        println!("cargo:rerun-if-changed=proto/google/rpc/status.proto");
-        println!("cargo:rerun-if-changed=proto/vector.proto");
+        println!("cargo:rerun-if-changed=proto/third-party/google/pubsub/v1/pubsub.proto");
+        println!("cargo:rerun-if-changed=proto/third-party/google/rpc/status.proto");
+        println!("cargo:rerun-if-changed=proto/vector/dd_metric.proto");
+        println!("cargo:rerun-if-changed=proto/vector/dd_trace.proto");
+        println!("cargo:rerun-if-changed=proto/vector/ddsketch_full.proto");
+        println!("cargo:rerun-if-changed=proto/vector/vector.proto");
+
+        // Create and store the "file descriptor set" from the compiled Protocol Buffers packages.
+        //
+        // This allows us to use runtime reflection to manually build Protocol Buffers payloads
+        // in a type-safe way, which is necessary for incrementally building certain payloads, like
+        // the ones generated in the `datadog_metrics` sink.
+        let protobuf_fds_path =
+            Path::new(&std::env::var("OUT_DIR").expect("OUT_DIR environment variable not set"))
+                .join("protobuf-fds.bin");
 
         let mut prost_build = prost_build::Config::new();
-        prost_build.btree_map(["."]);
+        prost_build
+            .btree_map(["."])
+            .file_descriptor_set_path(protobuf_fds_path);
 
         tonic_build::configure()
             .protoc_arg("--experimental_allow_proto3_optional")
@@ -116,15 +143,18 @@ fn main() {
                 prost_build,
                 &[
                     "lib/vector-core/proto/event.proto",
-                    "proto/dnstap.proto",
-                    "proto/ddsketch_full.proto",
-                    "proto/dd_metric.proto",
-                    "proto/dd_trace.proto",
-                    "proto/google/pubsub/v1/pubsub.proto",
-                    "proto/google/rpc/status.proto",
-                    "proto/vector.proto",
+                    "proto/vector/ddsketch_full.proto",
+                    "proto/vector/dd_metric.proto",
+                    "proto/vector/dd_trace.proto",
+                    "proto/third-party/google/pubsub/v1/pubsub.proto",
+                    "proto/third-party/google/rpc/status.proto",
+                    "proto/vector/vector.proto",
                 ],
-                &["proto/", "lib/vector-core/proto/"],
+                &[
+                    "proto/third-party",
+                    "proto/vector",
+                    "lib/vector-core/proto/",
+                ],
             )
             .unwrap();
     }
@@ -161,6 +191,24 @@ fn main() {
         .get_env_var("CARGO_PKG_RUST_VERSION")
         .expect("Cargo-provided environment variables should always exist!");
     let build_desc = tracker.get_env_var("VECTOR_BUILD_DESC");
+
+    // Get the git short hash of the HEAD.
+    // Note that if Vector is compiled within a container, proper git permissions must be set for
+    // the repo directory.
+    // In CI build workflows this will have been pre-configured by running the command
+    // "git config --global --add safe.directory /git/vectordotdev/vector", from the vdev package
+    // subcommands.
+    let git_short_hash = git_short_hash()
+        .map_err(|e| {
+            #[allow(clippy::print_stderr)]
+            {
+                eprintln!(
+                    "Unable to determine git short hash from rev-parse command: {}",
+                    e
+                );
+            }
+        })
+        .expect("git hash detection failed");
 
     // Gather up the constants and write them out to our build constants file.
     let mut constants = BuildConstants::new();
@@ -205,6 +253,11 @@ fn main() {
         "VECTOR_BUILD_DESC",
         "Special build description, related to versioned releases.",
         build_desc,
+    );
+    constants.add_required_constant(
+        "GIT_SHORT_HASH",
+        "The short hash of the Git HEAD",
+        git_short_hash,
     );
     constants
         .write_to_file("built.rs")

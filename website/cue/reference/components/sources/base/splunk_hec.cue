@@ -9,7 +9,7 @@ base: components: sources: splunk_hec: configuration: {
 				description: """
 					Whether or not to remove channels after idling for `max_idle_time` seconds.
 
-					A channel is idling if it is not used for sending data or querying ack statuses.
+					A channel is idling if it is not used for sending data or querying acknowledgement statuses.
 					"""
 				required: false
 				type: bool: default: false
@@ -41,7 +41,7 @@ base: components: sources: splunk_hec: configuration: {
 			}
 			max_pending_acks: {
 				description: """
-					The maximum number of ack statuses pending query across all channels.
+					The maximum number of acknowledgement statuses pending query across all channels.
 
 					Equivalent to the `max_number_of_acked_requests_pending_query` Splunk HEC setting.
 
@@ -52,7 +52,7 @@ base: components: sources: splunk_hec: configuration: {
 			}
 			max_pending_acks_per_channel: {
 				description: """
-					The maximum number of ack statuses pending query for a single channel.
+					The maximum number of acknowledgement statuses pending query for a single channel.
 
 					Equivalent to the `max_number_of_acked_requests_pending_query_per_ack_channel` Splunk HEC setting.
 
@@ -71,6 +71,40 @@ base: components: sources: splunk_hec: configuration: {
 			"""
 		required: false
 		type: string: default: "0.0.0.0:8088"
+	}
+	keepalive: {
+		description: "Configuration of HTTP server keepalive parameters."
+		required:    false
+		type: object: options: {
+			max_connection_age_jitter_factor: {
+				description: """
+					The factor by which to jitter the `max_connection_age_secs` value.
+
+					A value of 0.1 means that the actual duration will be between 90% and 110% of the
+					specified maximum duration.
+					"""
+				required: false
+				type: float: default: 0.1
+			}
+			max_connection_age_secs: {
+				description: """
+					The maximum amount of time a connection may exist before it is closed by sending
+					a `Connection: close` header on the HTTP response. Set this to a large value like
+					`100000000` to "disable" this feature
+
+					Only applies to HTTP/0.9, HTTP/1.0, and HTTP/1.1 requests.
+
+					A random jitter configured by `max_connection_age_jitter_factor` is added
+					to the specified duration to spread out connection storms.
+					"""
+				required: false
+				type: uint: {
+					default: 300
+					examples: [600]
+					unit: "seconds"
+				}
+			}
+		}
 	}
 	store_hec_token: {
 		description: """
@@ -145,16 +179,25 @@ base: components: sources: splunk_hec: configuration: {
 				required: false
 				type: string: examples: ["${KEY_PASS_ENV_VAR}", "PassWord1"]
 			}
+			server_name: {
+				description: """
+					Server name to use when using Server Name Indication (SNI).
+
+					Only relevant for outgoing connections.
+					"""
+				required: false
+				type: string: examples: ["www.example.com"]
+			}
 			verify_certificate: {
 				description: """
-					Enables certificate verification.
+					Enables certificate verification. For components that create a server, this requires that the
+					client connections have a valid client certificate. For components that initiate requests,
+					this validates that the upstream has a valid certificate.
 
 					If enabled, certificates must not be expired and must be issued by a trusted
 					issuer. This verification operates in a hierarchical manner, checking that the leaf certificate (the
 					certificate presented by the client/server) is not only valid, but that the issuer of that certificate is also valid, and
 					so on until the verification process reaches a root certificate.
-
-					Relevant for both incoming and outgoing connections.
 
 					Do NOT set this to `false` unless you understand the risks of not verifying the validity of certificates.
 					"""
@@ -193,7 +236,7 @@ base: components: sources: splunk_hec: configuration: {
 	}
 	valid_tokens: {
 		description: """
-			Optional list of valid authorization tokens.
+			A list of valid authorization tokens.
 
 			If supplied, incoming requests must supply one of these tokens in the `Authorization` header, just as a client
 			would if it was communicating with the Splunk HEC endpoint directly.

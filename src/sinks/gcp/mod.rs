@@ -1,13 +1,11 @@
 use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
-use vector_config::configurable_component;
+use vector_lib::configurable::configurable_component;
 
-pub mod chronicle_unstructured;
 pub mod cloud_storage;
 pub mod pubsub;
-pub mod stackdriver_logs;
-pub mod stackdriver_metrics;
+pub mod stackdriver;
 
 /// A monitored resource.
 ///
@@ -103,18 +101,18 @@ pub struct GcpResource {
 
 #[derive(Serialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
-pub struct GcpSerie<'a> {
+pub struct GcpSerie {
     pub metric: GcpMetric,
     pub resource: GcpResource,
     pub metric_kind: GcpMetricKind,
     pub value_type: GcpValueType,
-    pub points: &'a [GcpPoint],
+    pub points: Vec<GcpPoint>,
 }
 
 #[derive(Serialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct GcpSeries<'a> {
-    time_series: &'a [GcpSerie<'a>],
+    time_series: &'a [GcpSerie],
 }
 
 fn serialize_int64_value<S>(value: &Option<i64>, serializer: S) -> Result<S::Ok, S::Error>
@@ -151,14 +149,15 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeZone;
 
     /// Ensures that serialized `GcpSeries` matches the format that GCP expects (https://cloud.google.com/monitoring/api/ref_v3/rest/v3/TimeSeries).
     #[test]
     fn serialize_gcp_series() {
-        let end_time = chrono::DateTime::from_utc(
-            chrono::NaiveDate::from_ymd(2023, 2, 14).and_hms(10, 00, 00),
-            chrono::Utc,
-        );
+        let end_time = chrono::Utc
+            .with_ymd_and_hms(2023, 2, 14, 10, 0, 0)
+            .single()
+            .expect("invalid timestamp");
         let gcp_series = GcpSeries {
             time_series: &[GcpSerie {
                 metric: GcpMetric {
@@ -179,7 +178,7 @@ mod tests {
                 },
                 metric_kind: GcpMetricKind::Gauge,
                 value_type: GcpValueType::Int64,
-                points: &[GcpPoint {
+                points: vec![GcpPoint {
                     interval: GcpInterval {
                         start_time: None,
                         end_time,

@@ -14,9 +14,9 @@ base: components: sinks: humio_logs: configuration: {
 			description: """
 				Whether or not end-to-end acknowledgements are enabled.
 
-				When enabled for a sink, any source connected to that sink, where the source supports
-				end-to-end acknowledgements as well, will wait for events to be acknowledged by the sink
-				before acknowledging them at the source.
+				When enabled for a sink, any source connected to that sink where the source supports
+				end-to-end acknowledgements as well, waits for events to be acknowledged by **all
+				connected** sinks before acknowledging them at the source.
 
 				Enabling or disabling acknowledgements at the sink level takes precedence over any global
 				[`acknowledgements`][global_acks] configuration.
@@ -33,10 +33,10 @@ base: components: sinks: humio_logs: configuration: {
 		type: object: options: {
 			max_bytes: {
 				description: """
-					The maximum size of a batch that will be processed by a sink.
+					The maximum size of a batch that is processed by a sink.
 
 					This is based on the uncompressed size of the batched events, before they are
-					serialized / compressed.
+					serialized/compressed.
 					"""
 				required: false
 				type: uint: {
@@ -75,10 +75,20 @@ base: components: sinks: humio_logs: configuration: {
 					[gzip]: https://www.gzip.org/
 					"""
 				none: "No compression."
+				snappy: """
+					[Snappy][snappy] compression.
+
+					[snappy]: https://github.com/google/snappy/blob/main/docs/README.md
+					"""
 				zlib: """
 					[Zlib][zlib] compression.
 
 					[zlib]: https://zlib.net/
+					"""
+				zstd: """
+					[Zstandard][zstd] compression.
+
+					[zstd]: https://facebook.github.io/zstd/
 					"""
 			}
 		}
@@ -97,6 +107,91 @@ base: components: sinks: humio_logs: configuration: {
 					type: string: examples: ["{ \"type\": \"record\", \"name\": \"log\", \"fields\": [{ \"name\": \"message\", \"type\": \"string\" }] }"]
 				}
 			}
+			cef: {
+				description:   "The CEF Serializer Options."
+				relevant_when: "codec = \"cef\""
+				required:      true
+				type: object: options: {
+					device_event_class_id: {
+						description: """
+																Unique identifier for each event type. Identifies the type of event reported.
+																The value length must be less than or equal to 1023.
+																"""
+						required: true
+						type: string: {}
+					}
+					device_product: {
+						description: """
+																Identifies the product of a vendor.
+																The part of a unique device identifier. No two products can use the same combination of device vendor and device product.
+																The value length must be less than or equal to 63.
+																"""
+						required: true
+						type: string: {}
+					}
+					device_vendor: {
+						description: """
+																Identifies the vendor of the product.
+																The part of a unique device identifier. No two products can use the same combination of device vendor and device product.
+																The value length must be less than or equal to 63.
+																"""
+						required: true
+						type: string: {}
+					}
+					device_version: {
+						description: """
+																Identifies the version of the problem. In combination with device product and vendor, it composes the unique id of the device that sends messages.
+																The value length must be less than or equal to 31.
+																"""
+						required: true
+						type: string: {}
+					}
+					extensions: {
+						description: """
+																The collection of key-value pairs. Keys are the keys of the extensions, and values are paths that point to the extension values of a log event.
+																The event can have any number of key-value pairs in any order.
+																"""
+						required: false
+						type: object: options: "*": {
+							description: "This is a path that points to the extension value of a log event."
+							required:    true
+							type: string: {}
+						}
+					}
+					name: {
+						description: """
+																This is a path that points to the human-readable description of a log event.
+																The value length must be less than or equal to 512.
+																Equals "cef.name" by default.
+																"""
+						required: true
+						type: string: {}
+					}
+					severity: {
+						description: """
+																This is a path that points to the field of a log event that reflects importance of the event.
+																Reflects importance of the event.
+
+																It must point to a number from 0 to 10.
+																0 = Lowest, 10 = Highest.
+																Equals to "cef.severity" by default.
+																"""
+						required: true
+						type: string: {}
+					}
+					version: {
+						description: """
+																CEF Version. Can be either 0 or 1.
+																Equals to "0" by default.
+																"""
+						required: true
+						type: string: enum: {
+							V0: "CEF specification version 0.1."
+							V1: "CEF specification version 1.x."
+						}
+					}
+				}
+			}
 			codec: {
 				description: "The codec to use for encoding events."
 				required:    true
@@ -106,6 +201,7 @@ base: components: sinks: humio_logs: configuration: {
 
 						[apache_avro]: https://avro.apache.org/
 						"""
+					cef: "Encodes an event as a CEF (Common Event Format) formatted message."
 					csv: """
 						Encodes an event as a CSV message.
 
@@ -114,7 +210,20 @@ base: components: sinks: humio_logs: configuration: {
 					gelf: """
 						Encodes an event as a [GELF][gelf] message.
 
+						This codec is experimental for the following reason:
+
+						The GELF specification is more strict than the actual Graylog receiver.
+						Vector's encoder currently adheres more strictly to the GELF spec, with
+						the exception that some characters such as `@`  are allowed in field names.
+
+						Other GELF codecs such as Loki's, use a [Go SDK][implementation] that is maintained
+						by Graylog, and is much more relaxed than the GELF spec.
+
+						Going forward, Vector will use that [Go SDK][implementation] as the reference implementation, which means
+						the codec may continue to relax the enforcement of specification.
+
 						[gelf]: https://docs.graylog.org/docs/gelf
+						[implementation]: https://github.com/Graylog2/go-gelf/blob/v2/gelf/reader.go
 						"""
 					json: """
 						Encodes an event as [JSON][json].
@@ -127,7 +236,7 @@ base: components: sinks: humio_logs: configuration: {
 						[logfmt]: https://brandur.org/logfmt
 						"""
 					native: """
-						Encodes an event in Vector’s [native Protocol Buffers format][vector_native_protobuf].
+						Encodes an event in the [native Protocol Buffers format][vector_native_protobuf].
 
 						This codec is **[experimental][experimental]**.
 
@@ -135,30 +244,35 @@ base: components: sinks: humio_logs: configuration: {
 						[experimental]: https://vector.dev/highlights/2022-03-31-native-event-codecs
 						"""
 					native_json: """
-						Encodes an event in Vector’s [native JSON format][vector_native_json].
+						Encodes an event in the [native JSON format][vector_native_json].
 
 						This codec is **[experimental][experimental]**.
 
 						[vector_native_json]: https://github.com/vectordotdev/vector/blob/master/lib/codecs/tests/data/native_encoding/schema.cue
 						[experimental]: https://vector.dev/highlights/2022-03-31-native-event-codecs
 						"""
+					protobuf: """
+						Encodes an event as a [Protobuf][protobuf] message.
+
+						[protobuf]: https://protobuf.dev/
+						"""
 					raw_message: """
 						No encoding.
 
-						This "encoding" simply uses the `message` field of a log event.
+						This encoding uses the `message` field of a log event.
 
-						Users should take care if they're modifying their log events (such as by using a `remap`
-						transform, etc) and removing the message field while doing additional parsing on it, as this
+						Be careful if you are modifying your log events (for example, by using a `remap`
+						transform) and removing the message field while doing additional parsing on it, as this
 						could lead to the encoding emitting empty strings for the given event.
 						"""
 					text: """
 						Plain text encoding.
 
-						This "encoding" simply uses the `message` field of a log event. For metrics, it uses an
+						This encoding uses the `message` field of a log event. For metrics, it uses an
 						encoding that resembles the Prometheus export format.
 
-						Users should take care if they're modifying their log events (such as by using a `remap`
-						transform, etc) and removing the message field while doing additional parsing on it, as this
+						Be careful if you are modifying your log events (for example, by using a `remap`
+						transform) and removing the message field while doing additional parsing on it, as this
 						could lead to the encoding emitting empty strings for the given event.
 						"""
 				}
@@ -167,24 +281,98 @@ base: components: sinks: humio_logs: configuration: {
 				description:   "The CSV Serializer Options."
 				relevant_when: "codec = \"csv\""
 				required:      true
-				type: object: options: fields: {
-					description: """
-						Configures the fields that will be encoded, as well as the order in which they
-						appear in the output.
+				type: object: options: {
+					capacity: {
+						description: """
+																Set the capacity (in bytes) of the internal buffer used in the CSV writer.
+																This defaults to a reasonable setting.
+																"""
+						required: false
+						type: uint: default: 8192
+					}
+					delimiter: {
+						description: "The field delimiter to use when writing CSV."
+						required:    false
+						type: ascii_char: default: ","
+					}
+					double_quote: {
+						description: """
+																Enable double quote escapes.
 
-						If a field is not present in the event, the output will be an empty string.
+																This is enabled by default, but it may be disabled. When disabled, quotes in
+																field data are escaped instead of doubled.
+																"""
+						required: false
+						type: bool: default: true
+					}
+					escape: {
+						description: """
+																The escape character to use when writing CSV.
 
-						Values of type `Array`, `Object`, and `Regex` are not supported and the
-						output will be an empty string.
-						"""
-					required: true
-					type: array: items: type: string: {}
+																In some variants of CSV, quotes are escaped using a special escape character
+																like \\ (instead of escaping quotes by doubling them).
+
+																To use this, `double_quotes` needs to be disabled as well otherwise it is ignored.
+																"""
+						required: false
+						type: ascii_char: default: "\""
+					}
+					fields: {
+						description: """
+																Configures the fields that will be encoded, as well as the order in which they
+																appear in the output.
+
+																If a field is not present in the event, the output will be an empty string.
+
+																Values of type `Array`, `Object`, and `Regex` are not supported and the
+																output will be an empty string.
+																"""
+						required: true
+						type: array: items: type: string: {}
+					}
+					quote: {
+						description: "The quote character to use when writing CSV."
+						required:    false
+						type: ascii_char: default: "\""
+					}
+					quote_style: {
+						description: "The quoting style to use when writing CSV data."
+						required:    false
+						type: string: {
+							default: "necessary"
+							enum: {
+								always: "Always puts quotes around every field."
+								necessary: """
+																			Puts quotes around fields only when necessary.
+																			They are necessary when fields contain a quote, delimiter, or record terminator.
+																			Quotes are also necessary when writing an empty record
+																			(which is indistinguishable from a record with one empty field).
+																			"""
+								never: "Never writes quotes, even if it produces invalid CSV data."
+								non_numeric: """
+																			Puts quotes around all fields that are non-numeric.
+																			Namely, when writing a field that does not parse as a valid float or integer,
+																			then quotes are used even if they aren't strictly necessary.
+																			"""
+							}
+						}
+					}
 				}
 			}
 			except_fields: {
-				description: "List of fields that will be excluded from the encoded event."
+				description: "List of fields that are excluded from the encoded event."
 				required:    false
 				type: array: items: type: string: {}
+			}
+			json: {
+				description:   "Options for the JsonSerializer."
+				relevant_when: "codec = \"json\""
+				required:      false
+				type: object: options: pretty: {
+					description: "Whether to use pretty JSON formatting."
+					required:    false
+					type: bool: default: false
+				}
 			}
 			metric_tag_values: {
 				description: """
@@ -208,16 +396,41 @@ base: components: sinks: humio_logs: configuration: {
 				}
 			}
 			only_fields: {
-				description: "List of fields that will be included in the encoded event."
+				description: "List of fields that are included in the encoded event."
 				required:    false
 				type: array: items: type: string: {}
+			}
+			protobuf: {
+				description:   "Options for the Protobuf serializer."
+				relevant_when: "codec = \"protobuf\""
+				required:      true
+				type: object: options: {
+					desc_file: {
+						description: """
+																The path to the protobuf descriptor set file.
+
+																This file is the output of `protoc -o <path> ...`
+																"""
+						required: true
+						type: string: examples: ["/etc/vector/protobuf_descriptor_set.desc"]
+					}
+					message_type: {
+						description: "The name of the message type to use for serializing."
+						required:    true
+						type: string: examples: ["package.Message"]
+					}
+				}
 			}
 			timestamp_format: {
 				description: "Format used for timestamp fields."
 				required:    false
 				type: string: enum: {
-					rfc3339: "Represent the timestamp as a RFC 3339 timestamp."
-					unix:    "Represent the timestamp as a Unix timestamp."
+					rfc3339:    "Represent the timestamp as a RFC 3339 timestamp."
+					unix:       "Represent the timestamp as a Unix timestamp."
+					unix_float: "Represent the timestamp as a Unix timestamp in floating point."
+					unix_ms:    "Represent the timestamp as a Unix timestamp in milliseconds."
+					unix_ns:    "Represent the timestamp as a Unix timestamp in nanoseconds."
+					unix_us:    "Represent the timestamp as a Unix timestamp in microseconds"
 				}
 			}
 		}
@@ -227,7 +440,7 @@ base: components: sinks: humio_logs: configuration: {
 			The base URL of the Humio instance.
 
 			The scheme (`http` or `https`) must be specified. No path should be included since the paths defined
-			by the [`Splunk`][splunk] api are used.
+			by the [`Splunk`][splunk] API are used.
 
 			[splunk]: https://docs.splunk.com/Documentation/Splunk/8.0.0/Data/HECRESTendpoints
 			"""
@@ -241,7 +454,7 @@ base: components: sinks: humio_logs: configuration: {
 		description: """
 			The type of events sent to this sink. Humio uses this as the name of the parser to use to ingest the data.
 
-			If unset, Humio will default it to none.
+			If unset, Humio defaults it to none.
 			"""
 		required: false
 		type: string: {
@@ -251,14 +464,15 @@ base: components: sinks: humio_logs: configuration: {
 	}
 	host_key: {
 		description: """
-			Overrides the name of the log field used to grab the hostname to send to Humio.
+			Overrides the name of the log field used to retrieve the hostname to send to Humio.
 
-			By default, the [global `log_schema.host_key` option][global_host_key] is used.
+			By default, the [global `log_schema.host_key` option][global_host_key] is used if log
+			events are Legacy namespaced, or the semantic meaning of "host" is used, if defined.
 
 			[global_host_key]: https://vector.dev/docs/reference/configuration/global-options/#log_schema.host_key
 			"""
 		required: false
-		type: string: default: "host"
+		type: string: default: ".host"
 	}
 	index: {
 		description: """
@@ -298,7 +512,9 @@ base: components: sinks: humio_logs: configuration: {
 		description: """
 			Middleware settings for outbound requests.
 
-			Various settings can be configured, such as concurrency and rate limits, timeouts, etc.
+			Various settings can be configured, such as concurrency and rate limits, timeouts, and retry behavior.
+
+			Note that the retry backoff policy follows the Fibonacci sequence.
 			"""
 		required: false
 		type: object: options: {
@@ -318,7 +534,7 @@ base: components: sinks: humio_logs: configuration: {
 																Valid values are greater than `0` and less than `1`. Smaller values cause the algorithm to scale back rapidly
 																when latency increases.
 
-																Note that the new limit is rounded down after applying this ratio.
+																**Note**: The new limit is rounded down after applying this ratio.
 																"""
 						required: false
 						type: float: default: 0.9
@@ -335,6 +551,26 @@ base: components: sinks: humio_logs: configuration: {
 																"""
 						required: false
 						type: float: default: 0.4
+					}
+					initial_concurrency: {
+						description: """
+																The initial concurrency limit to use. If not specified, the initial limit is 1 (no concurrency).
+
+																Datadog recommends setting this value to your service's average limit if you're seeing that it takes a
+																long time to ramp up adaptive concurrency after a restart. You can find this value by looking at the
+																`adaptive_concurrency_limit` metric.
+																"""
+						required: false
+						type: uint: default: 1
+					}
+					max_concurrency_limit: {
+						description: """
+																The maximum concurrency limit.
+
+																The adaptive request concurrency limit does not go above this bound. This is put in place as a safeguard.
+																"""
+						required: false
+						type: uint: default: 200
 					}
 					rtt_deviation_scale: {
 						description: """
@@ -353,14 +589,19 @@ base: components: sinks: humio_logs: configuration: {
 				}
 			}
 			concurrency: {
-				description: "Configuration for outbound request concurrency."
-				required:    false
+				description: """
+					Configuration for outbound request concurrency.
+
+					This can be set either to one of the below enum values or to a positive integer, which denotes
+					a fixed concurrency limit.
+					"""
+				required: false
 				type: {
 					string: {
-						default: "none"
+						default: "adaptive"
 						enum: {
 							adaptive: """
-															Concurrency will be managed by Vector's [Adaptive Request Concurrency][arc] feature.
+															Concurrency is managed by Vector's [Adaptive Request Concurrency][arc] feature.
 
 															[arc]: https://vector.dev/docs/about/under-the-hood/networking/arc/
 															"""
@@ -391,12 +632,8 @@ base: components: sinks: humio_logs: configuration: {
 				}
 			}
 			retry_attempts: {
-				description: """
-					The maximum number of retries to make for failed requests.
-
-					The default, for all intents and purposes, represents an infinite number of retries.
-					"""
-				required: false
+				description: "The maximum number of retries to make for failed requests."
+				required:    false
 				type: uint: {
 					default: 9223372036854775807
 					unit:    "retries"
@@ -406,7 +643,7 @@ base: components: sinks: humio_logs: configuration: {
 				description: """
 					The amount of time to wait before attempting the first retry for a failed request.
 
-					After the first retry has failed, the fibonacci sequence will be used to select future backoffs.
+					After the first retry has failed, the fibonacci sequence is used to select future backoffs.
 					"""
 				required: false
 				type: uint: {
@@ -414,11 +651,31 @@ base: components: sinks: humio_logs: configuration: {
 					unit:    "seconds"
 				}
 			}
+			retry_jitter_mode: {
+				description: "The jitter mode to use for retry backoff behavior."
+				required:    false
+				type: string: {
+					default: "Full"
+					enum: {
+						Full: """
+															Full jitter.
+
+															The random delay is anywhere from 0 up to the maximum current delay calculated by the backoff
+															strategy.
+
+															Incorporating full jitter into your backoff strategy can greatly reduce the likelihood
+															of creating accidental denial of service (DoS) conditions against your own systems when
+															many clients are recovering from a failure state.
+															"""
+						None: "No jitter."
+					}
+				}
+			}
 			retry_max_duration_secs: {
 				description: "The maximum amount of time to wait between retries."
 				required:    false
 				type: uint: {
-					default: 3600
+					default: 30
 					unit:    "seconds"
 				}
 			}
@@ -426,7 +683,7 @@ base: components: sinks: humio_logs: configuration: {
 				description: """
 					The time a request can take before being aborted.
 
-					It is highly recommended that you do not lower this value below the service’s internal timeout, as this could
+					Datadog highly recommends that you do not lower this value below the service's internal timeout, as this could
 					create orphaned requests, pile on retries, and result in duplicate data downstream.
 					"""
 				required: false
@@ -448,17 +705,19 @@ base: components: sinks: humio_logs: configuration: {
 	}
 	timestamp_key: {
 		description: """
-			Overrides the name of the log field used to grab the timestamp to send to Humio.
+			Overrides the name of the log field used to retrieve the timestamp to send to Humio.
+			When set to `“”`, a timestamp is not set in the events sent to Humio.
 
-			By default, the [global `log_schema.timestamp_key` option][global_timestamp_key] is used.
+			By default, either the [global `log_schema.timestamp_key` option][global_timestamp_key] is used
+			if log events are Legacy namespaced, or the semantic meaning of "timestamp" is used, if defined.
 
 			[global_timestamp_key]: https://vector.dev/docs/reference/configuration/global-options/#log_schema.timestamp_key
 			"""
 		required: false
-		type: string: default: "timestamp"
+		type: string: default: ".timestamp"
 	}
 	timestamp_nanos_key: {
-		description: "Overrides the name of the log field used to grab the nanosecond-enabled timestamp to send to Humio."
+		description: "Overrides the name of the log field used to retrieve the nanosecond-enabled timestamp to send to Humio."
 		required:    false
 		type: string: default: "@timestamp.nanos"
 	}
@@ -515,16 +774,25 @@ base: components: sinks: humio_logs: configuration: {
 				required: false
 				type: string: examples: ["${KEY_PASS_ENV_VAR}", "PassWord1"]
 			}
+			server_name: {
+				description: """
+					Server name to use when using Server Name Indication (SNI).
+
+					Only relevant for outgoing connections.
+					"""
+				required: false
+				type: string: examples: ["www.example.com"]
+			}
 			verify_certificate: {
 				description: """
-					Enables certificate verification.
+					Enables certificate verification. For components that create a server, this requires that the
+					client connections have a valid client certificate. For components that initiate requests,
+					this validates that the upstream has a valid certificate.
 
 					If enabled, certificates must not be expired and must be issued by a trusted
 					issuer. This verification operates in a hierarchical manner, checking that the leaf certificate (the
 					certificate presented by the client/server) is not only valid, but that the issuer of that certificate is also valid, and
 					so on until the verification process reaches a root certificate.
-
-					Relevant for both incoming and outgoing connections.
 
 					Do NOT set this to `false` unless you understand the risks of not verifying the validity of certificates.
 					"""

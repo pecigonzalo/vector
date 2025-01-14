@@ -1,26 +1,26 @@
 use std::collections::HashMap;
 
-use aws_types::credentials::SharedCredentialsProvider;
-use aws_types::region::Region;
 use bytes::{Buf, Bytes};
 use http::{Response, StatusCode, Uri};
 use hyper::{body, Body};
 use serde::Deserialize;
 use snafu::ResultExt;
-use vector_core::config::proxy::ProxyConfig;
-use vector_core::config::LogNamespace;
+use vector_lib::config::proxy::ProxyConfig;
+use vector_lib::config::LogNamespace;
 
 use super::{
     request_builder::ElasticsearchRequestBuilder, ElasticsearchApiVersion, ElasticsearchEncoder,
-    InvalidHostSnafu, Request,
+    InvalidHostSnafu, Request, VersionType,
 };
 use crate::{
-    http::{Auth, HttpClient, MaybeAuth},
+    http::{HttpClient, MaybeAuth},
     sinks::{
         elasticsearch::{
-            ElasticsearchAuth, ElasticsearchCommonMode, ElasticsearchConfig, ParseError,
+            ElasticsearchAuthConfig, ElasticsearchCommonMode, ElasticsearchConfig,
+            OpenSearchServiceType, ParseError,
         },
-        util::{http::RequestConfig, TowerRequestConfig, UriSerde},
+        util::auth::Auth,
+        util::{http::RequestConfig, UriSerde},
         HealthcheckError,
     },
     tls::TlsSettings,
@@ -31,12 +31,11 @@ use crate::{
 pub struct ElasticsearchCommon {
     pub base_url: String,
     pub bulk_uri: Uri,
-    pub http_auth: Option<Auth>,
-    pub aws_auth: Option<SharedCredentialsProvider>,
+    pub auth: Option<Auth>,
+    pub service_type: OpenSearchServiceType,
     pub mode: ElasticsearchCommonMode,
     pub request_builder: ElasticsearchRequestBuilder,
     pub tls_settings: TlsSettings,
-    pub region: Option<Region>,
     pub request: RequestConfig,
     pub query_params: HashMap<String, String>,
     pub metric_to_log: MetricToLog,
@@ -61,37 +60,65 @@ impl ElasticsearchCommon {
             .into());
         }
 
-        let authorization = match &config.auth {
-            Some(ElasticsearchAuth::Basic { user, password }) => Some(Auth::Basic {
-                user: user.clone(),
-                password: password.clone(),
-            }),
-            _ => None,
-        };
         let uri = endpoint.parse::<UriSerde>()?;
-        let http_auth = authorization.choose_one(&uri.auth)?;
-        let base_url = uri.uri.to_string().trim_end_matches('/').to_owned();
-
-        let aws_auth = match &config.auth {
-            Some(ElasticsearchAuth::Basic { .. }) | None => None,
-            Some(ElasticsearchAuth::Aws(aws)) => {
+        let auth = match &config.auth {
+            Some(ElasticsearchAuthConfig::Basic { user, password }) => {
+                let auth = Some(crate::http::Auth::Basic {
+                    user: user.clone(),
+                    password: password.clone(),
+                });
+                // basic auth must be some for now
+                let auth = auth.choose_one(&uri.auth)?.unwrap();
+                Some(Auth::Basic(auth))
+            }
+            #[cfg(feature = "aws-core")]
+            Some(ElasticsearchAuthConfig::Aws(aws)) => {
                 let region = config
                     .aws
                     .as_ref()
                     .map(|config| config.region())
                     .ok_or(ParseError::RegionRequired)?
                     .ok_or(ParseError::RegionRequired)?;
-
-                Some(aws.credentials_provider(region).await?)
+                Some(Auth::Aws {
+                    credentials_provider: aws
+                        .credentials_provider(region.clone(), proxy_config, config.tls.as_ref())
+                        .await?,
+                    region,
+                })
             }
+            None => None,
         };
+
+        if config.opensearch_service_type == OpenSearchServiceType::Serverless {
+            match &config.auth {
+                #[cfg(feature = "aws-core")]
+                Some(ElasticsearchAuthConfig::Aws(_)) => (),
+                _ => return Err(ParseError::OpenSearchServerlessRequiresAwsAuth.into()),
+            }
+        }
+
+        let base_url = uri.uri.to_string().trim_end_matches('/').to_owned();
 
         let mode = config.common_mode()?;
 
-        let tower_request = config
-            .request
-            .tower
-            .unwrap_with(&TowerRequestConfig::default());
+        let tower_request = config.request.tower.into_settings();
+
+        if config.bulk.version.is_some() && config.bulk.version_type == VersionType::Internal {
+            return Err(ParseError::ExternalVersionIgnoredWithInternalVersioning.into());
+        }
+        if config.bulk.version.is_some()
+            && (config.bulk.version_type == VersionType::External
+                || config.bulk.version_type == VersionType::ExternalGte)
+            && config.id_key.is_none()
+        {
+            return Err(ParseError::ExternalVersioningWithoutDocumentID.into());
+        }
+        if config.bulk.version.is_none()
+            && (config.bulk.version_type == VersionType::External
+                || config.bulk.version_type == VersionType::ExternalGte)
+        {
+            return Err(ParseError::ExternalVersioningWithoutVersion.into());
+        }
 
         let mut query_params = config.query.clone().unwrap_or_default();
         query_params.insert(
@@ -100,7 +127,9 @@ impl ElasticsearchCommon {
         );
 
         if let Some(pipeline) = &config.pipeline {
-            query_params.insert("pipeline".into(), pipeline.into());
+            if !pipeline.is_empty() {
+                query_params.insert("pipeline".into(), pipeline.into());
+            }
         }
 
         let bulk_url = {
@@ -112,7 +141,7 @@ impl ElasticsearchCommon {
         };
         let bulk_uri = bulk_url.parse::<Uri>().unwrap();
 
-        let tls_settings = TlsSettings::from_options(&config.tls)?;
+        let tls_settings = TlsSettings::from_options(config.tls.as_ref())?;
         let config = config.clone();
         let request = config.request;
 
@@ -124,9 +153,16 @@ impl ElasticsearchCommon {
             metric_config.metric_tag_values,
         );
 
-        let region = config.aws.as_ref().and_then(|config| config.region());
+        let service_type = config.opensearch_service_type;
 
-        let version = if let Some(version) = *version {
+        let version = if service_type == OpenSearchServiceType::Serverless {
+            if config.api_version != ElasticsearchApiVersion::Auto {
+                return Err(ParseError::ServerlessElasticsearchApiVersionMustBeAuto.into());
+            }
+            // Amazon OpenSearch Serverless does not support the cluster-version API; hardcode
+            // well-known API version
+            8
+        } else if let Some(version) = *version {
             version
         } else {
             let ver = match config.api_version {
@@ -136,16 +172,19 @@ impl ElasticsearchCommon {
                 ElasticsearchApiVersion::Auto => {
                     match get_version(
                         &base_url,
-                        &http_auth,
-                        &aws_auth,
-                        &region,
+                        auth.as_ref(),
+                        #[cfg(feature = "aws-core")]
+                        &service_type,
                         &request,
                         &tls_settings,
                         proxy_config,
                     )
                     .await
                     {
-                        Ok(version) => version,
+                        Ok(version) => {
+                            debug!(message = "Auto-detected Elasticsearch API version.", %version);
+                            version
+                        }
                         // This error should be fatal, but for now we only emit it as a warning
                         // to make the transition smoother.
                         Err(error) => {
@@ -156,11 +195,11 @@ impl ElasticsearchCommon {
                             // This is by no means a perfect assumption but it's the best we can
                             // make with the data we have.
                             let assumed_version = if config.suppress_type_name { 6 } else { 8 };
-                            debug!(message = "Assumed ElasticsearchApi based on config setting suppress_type_name.",
+                            debug!(message = "Assumed Elasticsearch API version based on config setting suppress_type_name.",
                                    %assumed_version,
                                    %config.suppress_type_name
                             );
-                            warn!(message = "Failed to determine Elasticsearch version from `/_cluster/state/version`. Please fix the reported error or set an API version explicitly via `api_version`.",
+                            warn!(message = "Failed to determine Elasticsearch API version. Please fix the reported error or set an API version explicitly via `api_version`.",
                                   %assumed_version,
                                   %error
                             );
@@ -190,15 +229,14 @@ impl ElasticsearchCommon {
         };
 
         Ok(Self {
-            http_auth,
+            auth,
+            service_type,
             base_url,
             bulk_uri,
-            aws_auth,
             mode,
             request_builder,
             query_params,
             request,
-            region,
             tls_settings,
             metric_to_log,
         })
@@ -235,61 +273,81 @@ impl ElasticsearchCommon {
     #[cfg(test)]
     pub async fn parse_single(config: &ElasticsearchConfig) -> crate::Result<Self> {
         let mut commons =
-            Self::parse_many(config, crate::config::SinkContext::new_test().proxy()).await?;
+            Self::parse_many(config, crate::config::SinkContext::default().proxy()).await?;
         assert_eq!(commons.len(), 1);
         Ok(commons.remove(0))
     }
 
     pub async fn healthcheck(self, client: HttpClient) -> crate::Result<()> {
-        match get(
-            &self.base_url,
-            &self.http_auth,
-            &self.aws_auth,
-            &self.region,
-            &self.request,
-            client,
-            "/_cluster/health",
-        )
-        .await?
-        .status()
-        {
-            StatusCode::OK => Ok(()),
-            status => Err(HealthcheckError::UnexpectedStatus { status }.into()),
+        if self.service_type == OpenSearchServiceType::Serverless {
+            warn!(message = "Amazon OpenSearch Serverless does not support healthchecks. Skipping healthcheck...");
+            Ok(())
+        } else {
+            match get(
+                &self.base_url,
+                self.auth.as_ref(),
+                #[cfg(feature = "aws-core")]
+                &self.service_type,
+                &self.request,
+                client,
+                "/_cluster/health",
+            )
+            .await?
+            .status()
+            {
+                StatusCode::OK => Ok(()),
+                status => Err(HealthcheckError::UnexpectedStatus { status }.into()),
+            }
         }
     }
 }
 
+#[cfg(feature = "aws-core")]
 pub async fn sign_request(
+    service_type: &OpenSearchServiceType,
     request: &mut http::Request<Bytes>,
-    credentials_provider: &SharedCredentialsProvider,
-    region: &Option<Region>,
+    credentials_provider: &aws_credential_types::provider::SharedCredentialsProvider,
+    region: Option<&aws_types::region::Region>,
 ) -> crate::Result<()> {
-    crate::aws::sign_request("es", request, credentials_provider, region).await
+    // Amazon OpenSearch Serverless requires the x-amz-content-sha256 header when calculating
+    // the AWS v4 signature:
+    // https://docs.aws.amazon.com/opensearch-service/latest/developerguide/serverless-clients.html#serverless-signing
+    crate::aws::sign_request(
+        service_type.as_str(),
+        request,
+        credentials_provider,
+        region,
+        *service_type == OpenSearchServiceType::Serverless,
+    )
+    .await
 }
 
 async fn get_version(
     base_url: &str,
-    http_auth: &Option<Auth>,
-    aws_auth: &Option<SharedCredentialsProvider>,
-    region: &Option<Region>,
+    auth: Option<&Auth>,
+    #[cfg(feature = "aws-core")] service_type: &OpenSearchServiceType,
     request: &RequestConfig,
     tls_settings: &TlsSettings,
     proxy_config: &ProxyConfig,
 ) -> crate::Result<usize> {
     #[derive(Deserialize)]
-    struct ClusterState {
-        version: Option<usize>,
+    struct Version {
+        number: Option<String>,
+    }
+    #[derive(Deserialize)]
+    struct ResponsePayload {
+        version: Option<Version>,
     }
 
     let client = HttpClient::new(tls_settings.clone(), proxy_config)?;
     let response = get(
         base_url,
-        http_auth,
-        aws_auth,
-        region,
+        auth,
+        #[cfg(feature = "aws-core")]
+        service_type,
         request,
         client,
-        "/_cluster/state/version",
+        "/",
     )
     .await
     .map_err(|error| format!("Failed to get Elasticsearch API version: {}", error))?;
@@ -297,34 +355,51 @@ async fn get_version(
     let (_, body) = response.into_parts();
     let mut body = body::aggregate(body).await?;
     let body = body.copy_to_bytes(body.remaining());
-    let ClusterState { version } = serde_json::from_slice(&body)?;
-    version.ok_or_else(||"Unexpected response from Elasticsearch endpoint `/_cluster/state/version`. Missing `version`. Consider setting `api_version` option.".into())
+    let ResponsePayload { version } = serde_json::from_slice(&body)?;
+    if let Some(version) = version {
+        if let Some(number) = version.number {
+            let v: Vec<&str> = number.split('.').collect();
+            if !v.is_empty() {
+                if let Ok(major_version) = v[0].parse::<usize>() {
+                    return Ok(major_version);
+                }
+            }
+        }
+    }
+    Err("Unexpected response from Elasticsearch endpoint `/`. Consider setting `api_version` option.".into())
 }
 
 async fn get(
     base_url: &str,
-    http_auth: &Option<Auth>,
-    aws_auth: &Option<SharedCredentialsProvider>,
-    region: &Option<Region>,
+    auth: Option<&Auth>,
+    #[cfg(feature = "aws-core")] service_type: &OpenSearchServiceType,
     request: &RequestConfig,
     client: HttpClient,
     path: &str,
 ) -> crate::Result<Response<Body>> {
     let mut builder = Request::get(format!("{}{}", base_url, path));
 
-    if let Some(authorization) = &http_auth {
-        builder = authorization.apply_builder(builder);
-    }
-
     for (header, value) in &request.headers {
         builder = builder.header(&header[..], &value[..]);
     }
-
     let mut request = builder.body(Bytes::new())?;
 
-    if let Some(credentials_provider) = aws_auth {
-        sign_request(&mut request, credentials_provider, region).await?;
+    if let Some(auth) = auth {
+        match auth {
+            Auth::Basic(http_auth) => {
+                http_auth.apply(&mut request);
+            }
+            #[cfg(feature = "aws-core")]
+            Auth::Aws {
+                credentials_provider: provider,
+                region,
+            } => {
+                let region = region.clone();
+                sign_request(service_type, &mut request, provider, Some(&region)).await?;
+            }
+        }
     }
+
     client
         .send(request.map(hyper::Body::from))
         .await

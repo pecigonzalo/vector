@@ -41,7 +41,7 @@ components: sources: opentelemetry: {
 		requirements: []
 		warnings: [
 			"""
-				The `opentelemetry` source only supports log events at this time.
+				The `opentelemetry` source only supports log and trace events at this time.
 				""",
 		]
 		notices: []
@@ -58,6 +58,12 @@ components: sources: opentelemetry: {
 			name: "logs"
 			description: """
 				Received log events will go to this output stream. Use `<component_id>.logs` as an input to downstream transforms and sinks.
+				"""
+		},
+		{
+			name: "traces"
+			description: """
+				Received trace events will go to this output stream. Use `<component_id>.traces` as an input to downstream transforms and sinks.
 				"""
 		},
 	]
@@ -106,6 +112,46 @@ components: sources: opentelemetry: {
 						]
 					}
 				}
+				"scope.name": {
+					description: "Instrumentation scope name (often logger name)."
+					required:    false
+					common:      true
+					type: string: {
+						default: null
+						examples: ["some.module.name"]
+					}
+				}
+				"scope.version": {
+					description: "Instrumentation scope version."
+					required:    false
+					common:      false
+					type: string: {
+						default: null
+						examples: ["1.2.3"]
+					}
+				}
+				"scope.attributes": {
+					description: "Set of attributes that belong to the instrumentation scope."
+					required:    false
+					common:      false
+					type: object: {
+						examples: [
+							{
+								"attr1": "value1"
+								"attr2": "value2"
+								"attr3": "value3"
+							},
+						]
+					}
+				}
+				"scope.dropped_attributes_count": {
+					description: "Number of attributes dropped from the instrumentation scope (if not zero)."
+					required:    false
+					common:      false
+					type: uint: {
+						unit: null
+					}
+				}
 				message: {
 					description: "Contains the body of the log record."
 					required:    false
@@ -136,7 +182,7 @@ components: sources: opentelemetry: {
 				severity_number: {
 					description: """
 						Numerical value of the severity.
-						
+
 						Smaller numerical values correspond to less severe events (such as debug events), larger numerical values correspond to more severe events (such as errors and critical events).
 						"""
 					required: false
@@ -168,7 +214,7 @@ components: sources: opentelemetry: {
 				timestamp: {
 					description: """
 						The UTC Datetime when the event occurred. If this value is unset, or `0`, it will be set to the `observed_timestamp` field.
-						
+
 						This field is converted from the `time_unix_nano` Protobuf field.
 						"""
 					required: true
@@ -177,7 +223,7 @@ components: sources: opentelemetry: {
 				observed_timestamp: {
 					description: """
 						The UTC Datetime when the event was observed by the collection system. If this value is unset, or `0`, it will be set to the current time.
-						
+
 						This field is converted from the `observed_time_unix_nano` Protobuf field.
 						"""
 					required: true
@@ -194,22 +240,30 @@ components: sources: opentelemetry: {
 		}
 	}
 
-	telemetry: metrics: {
-		component_discarded_events_total:     components.sources.internal_metrics.output.metrics.component_discarded_events_total
-		component_errors_total:               components.sources.internal_metrics.output.metrics.component_errors_total
-		component_received_bytes_total:       components.sources.internal_metrics.output.metrics.component_received_bytes_total
-		component_received_events_total:      components.sources.internal_metrics.output.metrics.component_received_events_total
-		component_received_event_bytes_total: components.sources.internal_metrics.output.metrics.component_received_event_bytes_total
-		events_in_total:                      components.sources.internal_metrics.output.metrics.events_in_total
-	}
-
 	how_it_works: {
 		tls: {
 			title: "Transport Layer Security (TLS)"
 			body:  """
-				  Vector uses [OpenSSL](\(urls.openssl)) for TLS protocols. You can
-				  adjust TLS behavior via the `grpc.tls.*` and `http.tls.*` options.
-				  """
+				Vector uses [OpenSSL](\(urls.openssl)) for TLS protocols due to OpenSSL's maturity. You can
+				enable and adjust TLS behavior via the `grpc.tls.*` and `http.tls.*` options and/or via an
+				[OpenSSL configuration file](\(urls.openssl_conf)). The file location defaults to
+				`/usr/local/ssl/openssl.cnf` or can be specified with the `OPENSSL_CONF` environment variable.
+				"""
 		}
+		traces: {
+			title: "Ingest OTLP traces"
+			body: """
+				Trace support is experimental and subject to change as Vector has no strongly-typed structure for traces internally. Instead traces are stored as a key/value map similar to logs. This may change in the future to be a structured format.
+				"""
+		}
+	}
+
+	telemetry: metrics: {
+		grpc_server_handler_duration_seconds: components.sources.internal_metrics.output.metrics.grpc_server_handler_duration_seconds
+		grpc_server_messages_received_total:  components.sources.internal_metrics.output.metrics.grpc_server_messages_received_total
+		grpc_server_messages_sent_total:      components.sources.internal_metrics.output.metrics.grpc_server_messages_sent_total
+		http_server_handler_duration_seconds: components.sources.internal_metrics.output.metrics.http_server_handler_duration_seconds
+		http_server_requests_received_total:  components.sources.internal_metrics.output.metrics.http_server_requests_received_total
+		http_server_responses_sent_total:     components.sources.internal_metrics.output.metrics.http_server_responses_sent_total
 	}
 }

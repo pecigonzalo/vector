@@ -12,7 +12,8 @@ set -u
 
 # If PACKAGE_ROOT is unset or empty, default it.
 PACKAGE_ROOT="${PACKAGE_ROOT:-"https://packages.timber.io/vector"}"
-VECTOR_VERSION="0.28.1"
+# If VECTOR_VERSION is unset or empty, default it.
+VECTOR_VERSION="${VECTOR_VERSION:-"0.44.0"}"
 _divider="--------------------------------------------------------------------------------"
 _prompt=">>>"
 _indent="   "
@@ -76,9 +77,11 @@ main() {
                 ;;
             --no-modify-path)
                 modify_path=no
+                shift
                 ;;
             -y)
                 prompt=no
+                shift
                 ;;
             *)
                 ;;
@@ -139,9 +142,13 @@ install_from_archive() {
     assert_nz "$_arch" "arch"
 
     local _archive_arch=""
+
     case "$_arch" in
         x86_64-apple-darwin)
             _archive_arch=$_arch
+            ;;
+        aarch64-apple-darwin)
+            _archive_arch="arm64-apple-darwin"
             ;;
         x86_64-*linux*-gnu)
             _archive_arch="x86_64-unknown-linux-gnu"
@@ -152,13 +159,13 @@ install_from_archive() {
         aarch64-*linux*)
             _archive_arch="aarch64-unknown-linux-musl"
             ;;
-	    armv7-*linux*-gnu)
+        armv7-*linux*-gnueabihf)
             _archive_arch="armv7-unknown-linux-gnueabihf"
             ;;
-	    armv7-*linux*-musl)
+        armv7-*linux*-musleabihf)
             _archive_arch="armv7-unknown-linux-musleabihf"
             ;;
-        *)
+          *)
             err "unsupported arch: $_arch"
             ;;
     esac
@@ -191,7 +198,9 @@ install_from_archive() {
         ensure tar -xzf "$_file" --directory="$_unpack_dir" --strip-components=2
         # copy all files (including hidden), ref: https://askubuntu.com/a/86891
         ensure cp -r "$_unpack_dir/bin/." "$prefix/bin"
-        ensure cp -r "$_unpack_dir/etc/." "$prefix/etc"
+        if [ -d "$_unpack_dir/etc/." ]; then
+          ensure cp -r "$_unpack_dir/etc/." "$prefix/etc"
+        fi
         ensure mkdir -p "$prefix/share/vector/config"
         ensure cp -r "$_unpack_dir/config/." "$prefix/share/vector/config"
         ensure cp "$_unpack_dir"/README.md "$prefix/share/vector/"
@@ -203,7 +212,7 @@ install_from_archive() {
     printf " ✓\n"
 
     if [ "$modify_path" = "yes" ]; then
-      local _path="export PATH=$PATH:$prefix/bin"
+      local _path="export PATH=\"$PATH:$prefix/bin\""
       add_to_path "${HOME}/.zprofile" "${_path}"
       add_to_path "${HOME}/.profile" "${_path}"
     fi
@@ -211,7 +220,7 @@ install_from_archive() {
     printf "%s Install succeeded! 🚀\n" "$_prompt"
     printf "%s To start Vector:\n" "$_prompt"
     printf "\n"
-    printf "%s vector --config $prefix/config/vector.toml\n" "$_indent"
+    printf "%s vector --config $prefix/config/vector.yaml\n" "$_indent"
     printf "\n"
     printf "%s More information at https://vector.dev/docs/\n" "$_prompt"
 
